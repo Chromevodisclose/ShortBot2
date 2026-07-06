@@ -1,0 +1,17 @@
+[Unit]
+Description=Short Bot #2 (paper trading Bybit)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/short_bot
+ExecStart=/usr/bin/python3 /opt/short_bot/bot.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/short_bot/logs/stdout.log
+StandardError=append:/opt/short_bot/logs/stderr.log
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+# Логи и данные
+logs/
+*.log
+__pycache__/
+*.pyc
+*.pkl
+*.gz
+.env
+
+# Временные файлы
+/tmp/
+.DS_Store

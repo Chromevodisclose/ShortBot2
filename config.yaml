@@ -1,0 +1,75 @@
+# ─────────────────────────────────────────────────────────────
+# Short Bot #2 — конфиг (paper trading на реальных данных Bybit)
+# Сценарий Б: монета впервые #1 по росту → откат на #2 → шорт #2
+# ─────────────────────────────────────────────────────────────
+
+# ── Торговля ──
+direction: short              # short | long
+mode: paper                   # paper (симуляция на реальных ценах)
+
+# ── Риск (настраиваемо) ──
+risk_pct: 2.0                 # % депозита на сделку (база = 2%)
+initial_balance: 1000.0       # стартовый депозит (USDT)
+max_open_positions: 3         # одновременно открытых позиций
+max_daily_entries: 20         # лимит входов в день
+
+# ── Стратегия: SL/TP/Trail/Act (% от цены входа) ──
+# Найдено grid search: макс Sharpe конфиг
+sl_pct: 30.0                  # стоп-лосс (монета растёт против шорта на 30%)
+tp_pct: 15.0                  # тейк-профит (монета падает на 15%)
+trail_pct: 10.0               # трейлинг отступ от минимума
+activation_pct: 1.0           # активация trail при падении на 1%
+min_sl_hold_seconds: 30       # мин. удержание SL (anti-noise)
+
+# ── Комиссии и проскальзывание ──
+commission_taker_pct: 0.055   # Bybit taker RT (0.055% round-trip)
+slippage_pct: 0.02            # проскальзывание на вход/выход
+funding_interval_hours: 8     # Bybit funding каждые 8 часов
+funding_rate_avg: 0.0001      # средний фандинг 0.01% за интервал (аппроксимация)
+
+# ── Сигнал ──
+ranking_interval_min: 15      # пересчёт ранжирования каждые N минут
+min_volume_usd: 100000        # мин. объём за день (фильтр неликвида)
+min_gain_pct: 0.0             # мин. рост от open для участия в ранге
+cooldown_symbol_hours: 24     # бан монеты после входа (часы)
+min_candles_for_rank: 10      # мин. минутных свечей с начала дня
+
+# ── Фильтр монет ──
+exclude_heavy: true           # исключить BTC/ETH/SOL и др. крупные
+exclude_symbols: []           # явно исключить (пусто = ничего)
+# Список "тяжёлых" монет (если exclude_heavy = true)
+heavy_symbols:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+  - XRPUSDT
+  - DOGEUSDT
+  - BNBUSDT
+  - ADAUSDT
+  - LTCUSDT
+  - BCHUSDT
+  - TRXUSDT
+  - DOTUSDT
+  - AVAXUSDT
+  - LINKUSDT
+  - TONUSDT
+  - MATICUSDT
+  - SHIBUSDT
+  - NEARUSDT
+  - APTUSDT
+  - FILUSDT
+  - ARBUSDT
+  - OPUSDT
+
+# ── Bybit API ──
+bybit_rest_url: https://api.bybit.com
+bybit_ws_url: wss://stream.bybit.com/v5/public/linear
+bybit_ws_max_reconnect: 999
+bybit_ws_ping_sec: 20
+
+# ── Логи ──
+log_dir: ./logs
+trades_file: ./logs/trades.jsonl
+positions_file: ./logs/positions.json
+equity_file: ./logs/equity.jsonl
+log_level: INFO
