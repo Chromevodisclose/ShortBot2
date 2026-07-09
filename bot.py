@@ -332,18 +332,17 @@ def process_position(pos, high, low, price, ts):
     if low < pos["min_price"]:
         pos["min_price"] = low
     # ── DCA: усреднение при росте на dca_trigger_pct% ──
+    # После DCA — continue (как в бэктесте): TP/SL/Trail проверяются со след. свечи
+    # Иначе на той же свече low мог достичь TP, а high — trigger, порядок неопределён
     if CFG.get("dca_enabled") and pos["dca_count"] < pos["dca_max_count"]:
         if high >= pos["dca_trigger_price"]:
             dca_average(pos, pos["dca_trigger_price"], ts)
-            # после DCA продолжаем проверку с обновлёнными параметрами
-            # (не return — TP/SL ниже могут сработать на той же свече)
-    # активация trail — при достижении act_price переносим SL на entry (breakeven защита)
+            return  # пропускаем проверки на этой свече (как continue в бэктесте)
+    # активация trail — при падении на act% от avg entry
+    # SL остаётся на sl_pct% от avg (как в бэктесте), НЕ переносится на breakeven
     if not pos["activated"] and pos["min_price"] <= pos["act_price"]:
         pos["activated"] = True
-        # Перенос SL на entry (breakeven) — защита, не закрывает позицию
-        old_sl = pos["sl_price"]
-        pos["sl_price"] = pos["entry_price"]
-        log.info(f"TRAIL ACTIVATED {pos['symbol']} min={pos['min_price']:.6f} act={pos['act_price']:.6f} SL→breakeven={pos['sl_price']:.6f} (was {old_sl:.6f})")
+        log.info(f"TRAIL ACTIVATED {pos['symbol']} min={pos['min_price']:.6f} act={pos['act_price']:.6f}")
     # TP (монета упала) — проверяем ПЕРВЫМ, не давая trail перебить тейк-профит
     if low <= pos["tp_price"]:
         close_position(pos, pos["tp_price"], "take_profit", ts)
