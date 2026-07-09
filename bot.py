@@ -53,7 +53,10 @@ class State:
         self.traded_today = set() # монеты по которым вошли (бан на день)
         self.prev_rank1 = None    # предыдущая #1
         self.last_rank_ts = 0
-        # funding tracking
+        # funding tracking — реальные ставки/интервалы из WS tickers (per-symbol)
+        self.funding_rate = {}       # symbol -> текущий fundingRate (из tickers)
+        self.next_funding_time = {}  # symbol -> nextFundingTime (ms epoch)
+        self.funding_applied = {}    # symbol -> последний nextFundingTime (ms) по которому уже списали
         self.last_funding_check = 0
         self.symbols = []         # активные USDT perp символы
 
@@ -88,8 +91,8 @@ def calc_position_size(entry_price, sl_pct, risk_pct, balance, leverage=1):
 # ── Paper executor ──
 COMMISSION = float(CFG["commission_taker_pct"]) / 100.0  # 0.00055
 SLIPPAGE = float(CFG["slippage_pct"]) / 100.0             # 0.0002
-FUNDING_INTERVAL = float(CFG["funding_interval_hours"]) * 3600
-FUNDING_RATE = float(CFG["funding_rate_avg"])
+# Фандинг берётся из WS tickers.{symbol} (fundingRate + nextFundingTime) —
+# реальные ставки и интервалы per-symbol (1ч/2ч/4ч/8ч), не захардкожены.
 
 
 def open_short(symbol, entry_price, qty, ts):
@@ -114,6 +117,8 @@ def open_short(symbol, entry_price, qty, ts):
         "commission_paid": commission,
         "funding_paid": 0.0,
         "last_funding_ts": ts,
+        "entry_next_funding_ms": STATE.next_funding_time.get(symbol, 0),  # ms epoch
+        "funding_rate_at_open": STATE.funding_rate.get(symbol, 0.0),
         "open_day": day_key(datetime.fromtimestamp(ts, tz=timezone.utc)),
     }
     STATE.balance -= commission  # комиссия списывается
@@ -130,14 +135,25 @@ def close_position(pos, exit_price, reason, ts):
     notional = pos["qty"] * fill
     commission = notional * COMMISSION
     STATE.balance -= commission
-    # фандинг: за время удержания
+    # фандинг списывался по реальным funding event'ам (apply_funding),
+    # каждый раз меняя STATE.balance напрямую. На закрытии добираем
+    # фандинг за неполный период после последнего event'а по текущей ставке.
     hold_sec = ts - pos["entry_ts"]
-    funding_periods = hold_sec / FUNDING_INTERVAL
-    # шорт платит фандинг если rate > 0 (обычно при пампе rate позитивный)
-    funding = pos["notional"] * FUNDING_RATE * funding_periods
-    STATE.balance -= funding
-    net_pnl = pnl - commission - funding
-    STATE.balance += net_pnl  # PnL добавляется к балансу
+    sym = pos["symbol"]
+    last_fund_ts = pos.get("last_funding_ts", pos["entry_ts"])
+    cur_rate = STATE.funding_rate.get(sym, 0.0)
+    interval_sec = 28800  # дефолт 8ч; Bybit отдаёт интервал per-symbol
+    frac_sec = ts - last_fund_ts
+    frac = frac_sec / interval_sec if interval_sec > 0 else 0
+    if frac > 1: frac = 1  # не больше одного интервала
+    partial_funding = notional * cur_rate * frac
+    STATE.balance += partial_funding
+    pos["funding_paid"] += partial_funding
+    funding = pos["funding_paid"]  # суммарный фандинг за позицию (>0=получили, <0=заплатили)
+    # net_pnl — для отчёта: PnL − комиссия + фандинг (со знаком)
+    net_pnl = pnl - commission + funding
+    # balance: commission уже списан, фандинг учтён по event'ам + partial → добавляем PnL
+    STATE.balance += pnl
     # запись сделки
     trade = {
         "id": pos["id"], "symbol": pos["symbol"], "side": "short",
@@ -158,15 +174,105 @@ def close_position(pos, exit_price, reason, ts):
 
 
 def apply_funding(pos, ts):
-    """Применить фандинг при пересечении интервала."""
-    elapsed = ts - pos["last_funding_ts"]
-    if elapsed >= FUNDING_INTERVAL:
-        periods = int(elapsed // FUNDING_INTERVAL)
-        funding = pos["notional"] * FUNDING_RATE * periods
-        STATE.balance -= funding
-        pos["funding_paid"] += funding
-        pos["last_funding_ts"] += periods * FUNDING_INTERVAL
-        log.debug(f"FUNDING {pos['symbol']} periods={periods} paid={funding:.4f}")
+    """Применить фандинг по реальным funding event'ам Bybit.
+
+    Контроль времени экспирации: nextFundingTime из ticker может меняться,
+    Bybit обновляет его после event'а. Чтобы не пропустить/не задвоить:
+      - отслеживаем последний применённый event ts (pos['last_funding_ts'])
+      - тянем /v5/market/funding/history для точных прошлых событий
+      - применяем все пропущенные event'ы между last_funding_ts и ts
+
+    Конвенция Bybit:
+      rate > 0 → лонги платят шортам → шорт ПОЛУЧАЕТ (balance растёт)
+      rate < 0 → шорты платят лонгам → шорт ПЛАТИТ  (balance падает)
+    Для шорта: Δbalance = +notional*rate  (rate>0 → плюс, rate<0 → минус).
+    """
+    sym = pos["symbol"]
+    last_fund_ts = pos.get("last_funding_ts", pos["entry_ts"])
+    # быстрый путь: проверим nextFundingTime из ticker
+    nf_ms = STATE.next_funding_time.get(sym)
+    nf_ts = nf_ms / 1000.0 if nf_ms else None
+
+    # если nextFundingTime есть и ещё не настал — ничего не делаем
+    if nf_ts and ts < nf_ts:
+        return
+
+    # nextFundingTime настал/прошёл — значит был event.
+    # Но nextFundingTime мог уже обновиться на следующий → тянем history
+    # чтобы поймать все event'ы между last_fund_ts и ts
+    events = fetch_funding_history(sym, last_fund_ts, ts)
+    if not events:
+        # history пуста — возможно API лагает, пробуем по ticker rate
+        if nf_ts and ts >= nf_ts and STATE.funding_applied.get(sym) != nf_ms:
+            rate = STATE.funding_rate.get(sym, 0.0)
+            cur_price = STATE.last_price.get(sym, pos["entry_price"])
+            cur_notional = pos["qty"] * cur_price
+            funding = cur_notional * rate
+            _apply_one_funding(pos, sym, nf_ts, rate, cur_notional, funding)
+        return
+
+    # применяем все пропущенные event'ы из history (точные ставка + время)
+    for ev in events:
+        ev_ts, ev_rate = ev
+        if ev_ts <= last_fund_ts:
+            continue  # уже применён
+        cur_price = STATE.last_price.get(sym, pos["entry_price"])
+        cur_notional = pos["qty"] * cur_price
+        funding = cur_notional * ev_rate
+        _apply_one_funding(pos, sym, ev_ts, ev_rate, cur_notional, funding)
+
+
+def _apply_one_funding(pos, sym, ev_ts, rate, cur_notional, funding):
+    """Применить один funding event к позиции и балансу."""
+    STATE.balance += funding
+    pos["funding_paid"] += funding  # >0 = получили, <0 = заплатили
+    pos["last_funding_ts"] = ev_ts
+    nf_ms = STATE.next_funding_time.get(sym)
+    if nf_ms:
+        STATE.funding_applied[sym] = nf_ms
+    direction = "RECEIVE" if funding >= 0 else "PAY"
+    log.info(f"FUNDING {sym} rate={rate*100:.4f}% notional={cur_notional:.2f} {direction}={funding:+.4f} event_ts={ev_ts:.0f} balance={STATE.balance:.2f}")
+
+
+# кэш funding history чтобы не дёргать API каждый тик
+_funding_history_cache = {}  # sym -> (last_fetch_ts, events)
+
+
+def fetch_funding_history(sym, since_ts, until_ts):
+    """Получить прошлые funding events из Bybit /v5/market/funding/history.
+
+    Возвращает [(event_ts, rate), ...] отсортированные по возрастанию.
+    Кэширует на 60с чтобы не спамить API.
+    """
+    now = time.time()
+    cached = _funding_history_cache.get(sym)
+    if cached and (now - cached[0]) < 60:
+        events = cached[1]
+    else:
+        url = f"{CFG['bybit_rest_url']}/v5/market/funding/history?category=linear&symbol={sym}&limit=50"
+        events = []
+        try:
+            import aiohttp as _aio
+            # синхронный запрос через requests нет — используем urllib
+            import urllib.request, json as _json
+            req = urllib.request.Request(url, headers={"User-Agent": "short-bot"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = _json.loads(resp.read())
+            for r in data.get("result", {}).get("list", []):
+                # Bybit: {fundingRate, fundingRateTimestamp}
+                try:
+                    ev_ts = int(r.get("fundingRateTimestamp", 0)) / 1000.0
+                    ev_rate = float(r.get("fundingRate", 0))
+                    events.append((ev_ts, ev_rate))
+                except (TypeError, ValueError):
+                    pass
+            events.sort(key=lambda x: x[0])
+        except Exception as e:
+            log.debug(f"funding history {sym}: {e}")
+            return []
+        _funding_history_cache[sym] = (now, events)
+    # фильтруем по окну [since_ts, until_ts]
+    return [(t, r) for t, r in events if since_ts < t <= until_ts]
 
 
 def process_position(pos, high, low, price, ts):
@@ -177,24 +283,29 @@ def process_position(pos, high, low, price, ts):
     # update min_price
     if low < pos["min_price"]:
         pos["min_price"] = low
-    # активация trail
+    # активация trail — при достижении act_price переносим SL на entry (breakeven защита)
     if not pos["activated"] and pos["min_price"] <= pos["act_price"]:
         pos["activated"] = True
-        log.info(f"TRAIL ACTIVATED {pos['symbol']} min={pos['min_price']:.6f} act={pos['act_price']:.6f}")
-    # trail stop
-    if pos["activated"]:
-        trail_stop = pos["min_price"] * (1 + pos["trail_pct"]/100)
-        if high >= trail_stop and pos["min_price"] < pos["entry_price"]:
-            close_position(pos, trail_stop, "trail", ts)
-            return
-    # SL (монета выросла против шорта)
-    if high >= pos["sl_price"]:
-        close_position(pos, pos["sl_price"], "stop_loss", ts)
-        return
-    # TP (монета упала)
+        # Перенос SL на entry (breakeven) — защита, не закрывает позицию
+        old_sl = pos["sl_price"]
+        pos["sl_price"] = pos["entry_price"]
+        log.info(f"TRAIL ACTIVATED {pos['symbol']} min={pos['min_price']:.6f} act={pos['act_price']:.6f} SL→breakeven={pos['sl_price']:.6f} (was {old_sl:.6f})")
+    # TP (монета упала) — проверяем ПЕРВЫМ, не давая trail перебить тейк-профит
     if low <= pos["tp_price"]:
         close_position(pos, pos["tp_price"], "take_profit", ts)
         return
+    # SL (монета выросла против шорта) — может быть breakeven после активации
+    if high >= pos["sl_price"]:
+        reason = "breakeven" if pos["activated"] and pos["sl_price"] <= pos["entry_price"] * 1.0001 else "stop_loss"
+        close_position(pos, pos["sl_price"], reason, ts)
+        return
+    # Trail stop — ТОЛЬКО в профите: стоп = min×(1+trail%), работает когда < entry
+    # Если trail_stop >= entry → трейл не активен (стоп выше entry = не имеет смысла для шорта)
+    if pos["activated"]:
+        trail_stop = pos["min_price"] * (1 + pos["trail_pct"]/100)
+        if trail_stop < pos["entry_price"] and high >= trail_stop:
+            close_position(pos, trail_stop, "trail", ts)
+            return
 
 
 # ── Ранжирование ──
@@ -354,7 +465,7 @@ def process_kline(sym, k, ts):
 
 
 def process_ticker(sym, data, ts):
-    """Обработать ticker: last price, 24h volume."""
+    """Обработать ticker: last price, 24h volume, fundingRate, nextFundingTime."""
     try:
         last = data.get("lastPrice")
         if last:
@@ -363,6 +474,23 @@ def process_ticker(sym, data, ts):
         if vol24 and sym not in STATE.day_volume:
             # если нет kline данных, используем 24h turnover как приближение
             STATE.day_volume[sym] = float(vol24)
+        # funding rate (перевод в долю: Bybit отдаёт как строку, напр. "0.0001")
+        fr = data.get("fundingRate")
+        if fr is not None and fr != "":
+            STATE.funding_rate[sym] = float(fr)
+        # next funding time (ms epoch) — когда произойдёт следующий funding event
+        nft = data.get("nextFundingTime")
+        if nft is not None and nft != "":
+            nft_ms = int(nft)
+            # если Bybit прислал новый nextFundingTime — сбрасываем отметку "уже списано"
+            if STATE.next_funding_time.get(sym) != nft_ms:
+                old = STATE.next_funding_time.get(sym)
+                STATE.next_funding_time[sym] = nft_ms
+                STATE.funding_applied.pop(sym, None)
+                # контроль экспирации: логируем изменение для открытых позиций
+                if any(p["symbol"] == sym for p in STATE.open_positions):
+                    old_str = f"{old/1000:.0f}" if old else "none"
+                    log.info(f"FUNDING-SCHEDULE {sym}: nextFundingTime {old_str} → {nft_ms/1000:.0f} (UTC {datetime.fromtimestamp(nft_ms/1000, tz=timezone.utc).strftime('%H:%M')})")
     except (TypeError, ValueError):
         pass
 
@@ -389,6 +517,42 @@ def save_positions():
         }, f, ensure_ascii=False, indent=2, default=str)
 
 
+def load_positions():
+    """Загрузить состояние из positions.json при старте — чтобы рестарт не сбрасывал позиции."""
+    path = CFG["positions_file"]
+    if not os.path.exists(path):
+        log.info("load_positions: файл не найден, старт с чистого листа")
+        return
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as e:
+        log.warning(f"load_positions: ошибка чтения {e}, старт с чистого листа")
+        return
+    # восстанавливаем только если день совпадает (не загружаем вчерашние позиции в новый день)
+    today = day_key(utc_now())
+    saved_day = data.get("day")
+    if saved_day != today:
+        log.info(f"load_positions: файл за {saved_day}, сегодня {today} — старт с чистого листа")
+        return
+    open_pos = data.get("open", [])
+    if not open_pos:
+        log.info(f"load_positions: открытых позиций нет, balance=${data.get('balance',0):.2f}")
+        STATE.balance = float(data.get("balance", STATE.balance))
+        STATE.equity = float(data.get("equity", STATE.balance))
+        STATE.closed_today = int(data.get("closed_today", 0))
+        return
+    # восстанавливаем позиции
+    STATE.balance = float(data.get("balance", STATE.balance))
+    STATE.equity = float(data.get("equity", STATE.balance))
+    STATE.closed_today = int(data.get("closed_today", 0))
+    STATE.open_positions = open_pos
+    # traded_today — монеты по которым уже входили (чтобы не входить повторно)
+    STATE.traded_today = {p["symbol"] for p in open_pos}
+    log.info(f"load_positions: восстановлено {len(open_pos)} позиций, balance=${STATE.balance:.2f}, "
+             f"traded_today={STATE.traded_today}")
+
+
 async def periodic_save():
     while True:
         save_positions()
@@ -404,12 +568,14 @@ async def periodic_status():
     while True:
         log.info(f"STATUS balance={STATE.balance:.2f} equity={STATE.equity:.2f} open={len(STATE.open_positions)} "
                  f"closed_today={STATE.closed_today} symbols={len(STATE.last_price)} "
-                 f"day_open={len(STATE.day_open)} first1={len(STATE.first1_today)} traded={len(STATE.traded_today)}")
+                 f"day_open={len(STATE.day_open)} first1={len(STATE.first1_today)} traded={len(STATE.traded_today)} "
+                 f"funding_known={len(STATE.funding_rate)}")
         await asyncio.sleep(120)  # каждые 2 мин
 
 
 # ── Main ──
 async def main():
+    load_positions()  # восстановить позиции и баланс после рестарта
     symbols = await fetch_symbols()
     STATE.symbols = symbols
     # для каждого символа ставим day_open из первого тикера
