@@ -15,10 +15,10 @@ max_daily_entries: 20         # лимит входов в день
 
 # ── Стратегия: SL/TP/Trail/Act (% от цены входа) ──
 # Найдено grid search: макс Sharpe конфиг
-sl_pct: 15.0                  # стоп-лосс (монета растёт против шорта на 30%)
-tp_pct: 15.0                  # тейк-профит (монета падает на 15%)
-trail_pct: 0.5
-activation_pct: 2.0
+sl_pct: 10.0
+tp_pct: 10.0
+trail_pct: 3.0
+activation_pct: 5.0
 min_sl_hold_seconds: 30       # мин. удержание SL (anti-noise)
 
 # ── Комиссии и проскальзывание ──
