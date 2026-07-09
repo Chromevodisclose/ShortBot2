@@ -15,10 +15,15 @@ max_daily_entries: 20         # лимит входов в день
 
 # ── Стратегия: SL/TP/Trail/Act (% от цены входа) ──
 # Найдено grid search: макс Sharpe конфиг
-sl_pct: 10.0
-tp_pct: 10.0
-trail_pct: 3.0
-activation_pct: 5.0
+sl_pct: 30.0                  # финальный SL после DCA (от avg entry)
+tp_pct: 5.0                   # тейк-профит (быстрый выход при падении 5%)
+trail_pct: 3.0                 # трейлинг отступ от минимума
+activation_pct: 1.0           # активация trail при падении на 1%
+# ── DCA усреднение ──
+dca_enabled: true             # включить усреднение при росте против шорта
+dca_max_count: 2              # макс количество усреднений (×2 = позиция до 3x)
+dca_trigger_pct: 10.0         # рост на N% → усреднение (докупаем шорт)
+dca_qty_multiplier: 1.0       # каждый DCA докупает ×N от изначального qty
 min_sl_hold_seconds: 30       # мин. удержание SL (anti-noise)
 
 # ── Комиссии и проскальзывание ──

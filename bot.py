@@ -26,7 +26,8 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("short_bot")
-log.info(f"=== Short Bot #2 старт | risk={CFG['risk_pct']}% SL={CFG['sl_pct']}% TP={CFG['tp_pct']}% Trail={CFG['trail_pct']}% Act={CFG['activation_pct']}% ===")
+dca_info = f" DCA={CFG.get('dca_enabled',False)}×{CFG.get('dca_max_count',0)} trig={CFG.get('dca_trigger_pct',0)}%" if CFG.get('dca_enabled') else ""
+log.info(f"=== Short Bot #2 старт | risk={CFG['risk_pct']}% SL={CFG['sl_pct']}% TP={CFG['tp_pct']}% Trail={CFG['trail_pct']}% Act={CFG['activation_pct']}%{dca_info} ===")
 
 
 def utc_now():
@@ -120,10 +121,18 @@ def open_short(symbol, entry_price, qty, ts):
         "entry_next_funding_ms": STATE.next_funding_time.get(symbol, 0),  # ms epoch
         "funding_rate_at_open": STATE.funding_rate.get(symbol, 0.0),
         "open_day": day_key(datetime.fromtimestamp(ts, tz=timezone.utc)),
+        # ── DCA поля ──
+        "dca_count": 0,                          # сколько усреднений сделано
+        "original_qty": qty,                      # изначальный qty (для DCA докупки)
+        "dca_trigger_price": fill * (1 + CFG.get("dca_trigger_pct", 10.0)/100),  # цена DCA триггера
+        "dca_max_count": CFG.get("dca_max_count", 0),  # макс усреднений
+        "dca_qty_mult": CFG.get("dca_qty_multiplier", 1.0),  # множитель докупки
+        "original_entry": fill,                   # изначальный entry (для отчёта)
     }
     STATE.balance -= commission  # комиссия списывается
     STATE.open_positions.append(pos)
-    log.info(f"OPEN SHORT {symbol} qty={qty:.6f} entry={fill:.6f} notional={notional:.2f} comm={commission:.4f} SL={pos['sl_price']:.6f} TP={pos['tp_price']:.6f}")
+    dca_trig = f" DCA_trig={pos['dca_trigger_price']:.6f}({CFG.get('dca_trigger_pct',0)}%)" if CFG.get("dca_enabled") else ""
+    log.info(f"OPEN SHORT {symbol} qty={qty:.6f} entry={fill:.6f} notional={notional:.2f} comm={commission:.4f} SL={pos['sl_price']:.6f} TP={pos['tp_price']:.6f}{dca_trig}")
     return pos
 
 
@@ -164,6 +173,8 @@ def close_position(pos, exit_price, reason, ts):
         "entry_ts": pos["entry_ts"], "exit_ts": ts,
         "hold_sec": hold_sec,
         "entry_price_pct": (pos["entry_price"] - fill) / pos["entry_price"] * 100,
+        "dca_count": pos.get("dca_count", 0),
+        "original_entry": pos.get("original_entry", pos["entry_price"]),
         "balance_after": STATE.balance,
         "date": day_key(datetime.fromtimestamp(ts, tz=timezone.utc)),
     }
@@ -275,14 +286,57 @@ def fetch_funding_history(sym, since_ts, until_ts):
     return [(t, r) for t, r in events if since_ts < t <= until_ts]
 
 
+def dca_average(pos, dca_price, ts):
+    """Усреднить шорт: докупаем qty по dca_price, пересчитываем avg entry, SL, TP, trail.
+    Для шорта: DCA при росте цены → докупаем выше → avg entry повышается.
+    Новый avg = (old_entry×old_qty + dca_price×new_qty) / total_qty
+    """
+    new_qty = pos["original_qty"] * pos["dca_qty_mult"]
+    fill = dca_price * (1 + SLIPPAGE)  # докупка по ask
+    old_cost = pos["entry_price"] * pos["qty"]
+    new_cost = fill * new_qty
+    total_qty = pos["qty"] + new_qty
+    avg_entry = (old_cost + new_cost) / total_qty
+    commission = fill * new_qty * COMMISSION
+
+    # Обновляем позицию
+    old_entry = pos["entry_price"]
+    pos["entry_price"] = avg_entry
+    pos["qty"] = total_qty
+    pos["notional"] = total_qty * avg_entry
+    pos["commission_paid"] += commission
+    pos["dca_count"] += 1
+
+    # Пересчитываем SL/TP/Act от нового avg entry
+    pos["sl_price"] = avg_entry * (1 + CFG["sl_pct"]/100)
+    pos["tp_price"] = avg_entry * (1 - CFG["tp_pct"]/100)
+    pos["act_price"] = avg_entry * (1 - CFG["activation_pct"]/100)
+    pos["dca_trigger_price"] = avg_entry * (1 + CFG.get("dca_trigger_pct", 10.0)/100)
+
+    # Сбрасываем активацию — trail пересчитается от нового avg
+    pos["activated"] = False
+    # min_price оставляем как есть — реальный минимум цены
+
+    STATE.balance -= commission
+    log.info(f"DCA#{pos['dca_count']} {pos['symbol']} avg={old_entry:.6f}→{avg_entry:.6f} "
+             f"qty={total_qty:.6f} dca_fill={fill:.6f} comm={commission:.4f} "
+             f"new_SL={pos['sl_price']:.6f} new_TP={pos['tp_price']:.6f}")
+
+
 def process_position(pos, high, low, price, ts):
-    """Проверить SL/TP/Trail по цене."""
+    """Проверить DCA/SL/TP/Trail по цене."""
     # anti-noise gate
     if ts - pos["entry_ts"] < CFG["min_sl_hold_seconds"]:
         return
     # update min_price
     if low < pos["min_price"]:
         pos["min_price"] = low
+    # ── DCA: усреднение при росте на dca_trigger_pct% ──
+    if CFG.get("dca_enabled") and pos["dca_count"] < pos["dca_max_count"]:
+        if high >= pos["dca_trigger_price"]:
+            dca_average(pos, pos["dca_trigger_price"], ts)
+            # после DCA продолжаем проверку с обновлёнными параметрами
+            # (не return — TP/SL ниже могут сработать на той же свече)
     # активация trail — при достижении act_price переносим SL на entry (breakeven защита)
     if not pos["activated"] and pos["min_price"] <= pos["act_price"]:
         pos["activated"] = True
