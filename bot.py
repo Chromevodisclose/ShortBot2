@@ -315,7 +315,7 @@ def dca_average(pos, dca_price, ts):
 
     # Сбрасываем активацию — trail пересчитается от нового avg
     pos["activated"] = False
-    # min_price оставляем как есть — реальный минимум цены
+    # min_price оставляем как есть — проверка trail идёт по original_entry
 
     STATE.balance -= commission
     log.info(f"DCA#{pos['dca_count']} {pos['symbol']} avg={old_entry:.6f}→{avg_entry:.6f} "
@@ -356,7 +356,10 @@ def process_position(pos, high, low, price, ts):
     # Если trail_stop >= entry → трейл не активен (стоп выше entry = не имеет смысла для шорта)
     if pos["activated"]:
         trail_stop = pos["min_price"] * (1 + pos["trail_pct"]/100)
-        if trail_stop < pos["entry_price"] and high >= trail_stop:
+        # Trail закрывает ТОЛЬКО когда реально в плюсе от ИЗНАЧАЛЬНОГО entry
+        # (не от avg_entry после DCA). Иначе закроет выше entry = минус для шорта.
+        # trail_stop < original_entry → цена упала достаточно, фиксируем профит
+        if trail_stop < pos.get("original_entry", pos["entry_price"]) and high >= trail_stop:
             close_position(pos, trail_stop, "trail", ts)
             return
 
