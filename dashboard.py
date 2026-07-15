@@ -107,7 +107,6 @@ async def api_overview(req):
     if len(eq) > MAX_PTS:
         stride = max(1, len(eq) // MAX_PTS)
         eq_sample = eq[::stride]
-        # always keep the last point
         if eq_sample[-1] is not eq[-1]:
             eq_sample = eq_sample + [eq[-1]]
     else:
@@ -117,7 +116,6 @@ async def api_overview(req):
               for e in eq_sample]
     # full-history metrics (computed on ALL points, not the sample)
     eq_all = [float(e.get("equity", 0)) for e in eq]
-    bal_all = [float(e.get("balance", 0)) for e in eq]
     init = float(cfg.get("initial_balance", 1000))
     cur_eq = eq_all[-1] if eq_all else init
     peak = cur_eq
@@ -146,7 +144,11 @@ async def api_overview(req):
         "updated": pos.get("updated"),
         "config": {k: cfg[k] for k in ("sl_pct", "tp_pct", "trail_pct", "activation_pct",
                                        "risk_pct", "max_open_positions", "max_daily_entries",
-                                       "initial_balance") if k in cfg},
+                                       "initial_balance",
+                                       "dca_enabled", "dca_max_count", "dca_trigger_pct",
+                                       "dca_qty_multiplier", "commission_taker_pct",
+                                       "slippage_pct", "ranking_interval_min",
+                                       "min_volume_usd") if k in cfg},
         "equity_curve": eq_pts,
         "eq_metrics": {
             "initial": round(init, 2),
@@ -215,11 +217,25 @@ async def api_open(req):
             "commission_paid": round(p.get("commission_paid", 0), 4),
             "funding_paid": round(p.get("funding_paid", 0), 4),
             "funding_rate_at_open": p.get("funding_rate_at_open"),
+            # unrealized net PnL = uPnL - commission - funding
+            "u_net_pnl": round((u_pnl or 0) - p.get("commission_paid", 0) - p.get("funding_paid", 0), 4) if u_pnl is not None else None,
+            # distances to key levels (% from current price)
+            "dist_to_tp": round((p.get("tp_price",0) / cur_price - 1) * 100, 2) if cur_price and p.get("tp_price") else None,
+            "dist_to_dca": round((p.get("dca_trigger_price",0) / cur_price - 1) * 100, 2) if cur_price and p.get("dca_trigger_price") and p.get("dca_count",0) < p.get("dca_max_count",0) else None,
+            "dist_to_sl": round((p.get("sl_price",0) / cur_price - 1) * 100, 2) if cur_price and p.get("sl_price") else None,
             "hold_sec": round(time.time() - float(p.get("entry_ts", 0)), 0),
             "hold_str": fmt_dur(time.time() - float(p.get("entry_ts", 0))),
             "last_price": cur_price,
             "u_pnl": round(u_pnl, 4) if u_pnl is not None else None,
             "u_pnl_pct": round(u_pnl_pct, 2) if u_pnl_pct is not None else None,
+            # DCA fields
+            "dca_count": p.get("dca_count", 0),
+            "dca_max_count": p.get("dca_max_count", 0),
+            "dca_trigger_price": p.get("dca_trigger_price"),
+            "dca_trigger_pct": round((p.get("dca_trigger_price",0)/p.get("entry_price",1)-1)*100, 1) if p.get("dca_trigger_price") and p.get("entry_price") else None,
+            "original_entry": p.get("original_entry"),
+            "original_qty": p.get("original_qty"),
+            "dca_events": p.get("dca_events", []),
         })
     return web.json_response({"open": rows})
 
@@ -251,6 +267,9 @@ async def api_trades(req):
             "entry_price_pct": t.get("entry_price_pct"),
             "balance_after": round(t.get("balance_after", 0), 2),
             "date": t.get("date"),
+            "dca_count": t.get("dca_count", 0),
+            "original_entry": t.get("original_entry"),
+            "dca_events": t.get("dca_events", []),
         })
     return web.json_response({"trades": rows, "total": len(rows)})
 
@@ -278,7 +297,13 @@ async def api_chart(req):
                              "sl_price": p.get("sl_price"), "tp_price": p.get("tp_price"),
                              "act_price": p.get("act_price"), "trail_pct": p.get("trail_pct"),
                              "min_price": p.get("min_price"), "activated": p.get("activated"),
-                             "exit_price": None, "exit_ts": None, "reason": "open"}
+                             "exit_price": None, "exit_ts": None, "reason": "open",
+                             "qty": p.get("qty"), "dca_count": p.get("dca_count", 0),
+                             "dca_trigger_price": p.get("dca_trigger_price"),
+                             "original_entry": p.get("original_entry"),
+                             "original_qty": p.get("original_qty"),
+                             "dca_events": p.get("dca_events", []),
+                             "avg_entry": p["entry_price"]}
                     break
     # для закрытой сделки достаём SL/TP/Trail из конфига (в логе их нет)
     if trade and trade.get("exit_ts") and "sl_price" not in trade:
@@ -299,6 +324,10 @@ async def api_chart(req):
     if trade:
         if trade.get("qty") is not None and trade.get("entry_price") is not None and "notional" not in trade:
             trade["notional"] = round(float(trade["qty"]) * float(trade["entry_price"]), 2)
+        trade.setdefault("dca_count", 0)
+        trade.setdefault("dca_events", [])
+        trade.setdefault("avg_entry", trade.get("entry_price"))
+        trade.setdefault("original_entry", trade.get("entry_price"))
         trade.setdefault("entry_str", fmt_ts(trade.get("entry_ts")))
         if trade.get("exit_ts"):
             trade["exit_str"] = fmt_ts(trade.get("exit_ts"))
@@ -315,26 +344,37 @@ async def api_chart(req):
 
     entry_ts = float(entry_ts)
     exit_ts = float(exit_ts) if exit_ts else time.time()
-    # окно: 30 мин до входа, 30 мин после выхода (или сейчас)
-    start = int((entry_ts - 1800) * 1000)
-    end = int((exit_ts + 1800) * 1000)
+    # окно: 12ч до входа, 12ч после выхода (или сейчас) — полный контекст
+    # Bybit limit=1000 свечей, при 12ч+12ч=24ч=1440 мин нужно >1000 → тянем батчами
+    pre_sec = 43200   # 12 часов до входа
+    post_sec = 43200  # 12 часов после выхода
+    start = int((entry_ts - pre_sec) * 1000)
+    end = int((exit_ts + post_sec) * 1000)
     # Bybit kline: interval 1m, limit до 1000, start/end
-    url = f"{BYBIT}/v5/market/kline?category=linear&symbol={sym}&interval=1&start={start}&end={end}&limit=1000"
+    # Bybit отдаёт max 1000 свечей за запрос. 24ч = 1440 мин → тянем в 2 батча
     candles = []
     async with aiohttp.ClientSession() as sess:
         try:
-            async with sess.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            # Батч 1: от start до start+1000min
+            mid = start + 1000 * 60 * 1000
+            url1 = f"{BYBIT}/v5/market/kline?category=linear&symbol={sym}&interval=1&start={start}&end={mid}&limit=1000"
+            async with sess.get(url1, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 data = await resp.json()
             for k in data.get("result", {}).get("list", []):
-                # bybit: [start, open, high, low, close, volume, turnover]
-                candles.append({
-                    "t": int(k[0]) / 1000,
-                    "o": float(k[1]), "h": float(k[2]),
-                    "l": float(k[3]), "c": float(k[4]), "v": float(k[5]),
-                })
+                candles.append({"t": int(k[0]) / 1000, "o": float(k[1]), "h": float(k[2]),
+                                "l": float(k[3]), "c": float(k[4]), "v": float(k[5])})
+            # Батч 2: от mid до end (если end > mid)
+            if end > mid:
+                url2 = f"{BYBIT}/v5/market/kline?category=linear&symbol={sym}&interval=1&start={mid}&end={end}&limit=1000"
+                async with sess.get(url2, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    data = await resp.json()
+                for k in data.get("result", {}).get("list", []):
+                    candles.append({"t": int(k[0]) / 1000, "o": float(k[1]), "h": float(k[2]),
+                                    "l": float(k[3]), "c": float(k[4]), "v": float(k[5])})
             candles.sort(key=lambda x: x["t"])
         except Exception as e:
             return web.json_response({"error": f"bybit: {e}"}, status=502)
+
 
     return web.json_response({
         "symbol": sym,
@@ -400,7 +440,17 @@ tr:hover { background: #1e2329; cursor: pointer; }
 #ruler-hint { font-size: 12px; }
 #tv-chart { height: 500px; width: 100%; border-radius: 8px; overflow: hidden; }
 #tv-chart iframe { border-radius: 8px; }
-#chart-box { height: 500px; background: #0b0e11; border-radius: 8px; }
+#chart-box { height: 520px; background: #0b0e11; border-radius: 8px; position: relative; }
+.chart-legend { position: absolute; top: 8px; left: 8px; z-index: 10; background: rgba(11,14,17,0.85); border: 1px solid #2b3139; border-radius: 6px; padding: 8px 12px; font-size: 12px; font-family: monospace; pointer-events: none; max-width: 300px; }
+.chart-legend .lg-row { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+.chart-legend .lg-dot { width: 12px; height: 2px; border-radius: 1px; flex-shrink: 0; }
+.chart-legend .lg-label { color: #d1d4dc; min-width: 36px; font-weight: 600; }
+.chart-legend .lg-price { color: #848e9c; margin-left: auto; }
+.chart-legend .lg-pct { color: #f0b90b; font-size: 11px; margin-left: 4px; }
+.ruler-btn { position: absolute; top: 8px; right: 8px; z-index: 12; padding: 5px 10px; background: #1e2329; color: #848e9c; border: 1px solid #2b3139; border-radius: 5px; cursor: pointer; font-size: 12px; font-family: monospace; user-select: none; }
+.ruler-btn:hover { background: #2b3139; color: #d1d4dc; }
+.ruler-btn.active { background: #f0b90b; color: #0b0e11; border-color: #f0b90b; }
+.chart-info { position: absolute; top: 8px; left: 50%; transform: translateX(-50%); z-index: 10; background: rgba(11,14,17,0.85); border: 1px solid #2b3139; border-radius: 6px; padding: 6px 10px; font-size: 12px; color: #d1d4dc; font-family: monospace; pointer-events: none; }
 .chart-tabs { display: flex; gap: 4px; margin-bottom: 8px; }
 .ctab { padding: 6px 14px; background: #1e2329; border-radius: 6px 6px 0 0; cursor: pointer; color: #848e9c; font-size: 13px; }
 .ctab.active { background: #f0b90b; color: #0b0e11; font-weight: 600; }
@@ -437,6 +487,10 @@ tr:hover { background: #1e2329; cursor: pointer; }
     </div>
   </div>
   <div class="card">
+    <div class="lbl muted" style="margin-bottom:8px">СТРАТЕГИЯ</div>
+    <div id="strategy-desc" style="font-size:13px;line-height:1.6"></div>
+  </div>
+  <div class="card">
     <div class="lbl muted" style="margin-bottom:6px">КОНФИГ</div>
     <div id="cfg" class="grid"></div>
   </div>
@@ -445,7 +499,7 @@ tr:hover { background: #1e2329; cursor: pointer; }
 <div id="view-open" class="hidden">
   <div class="card">
     <table id="open-table"><thead>
-      <tr><th>Symbol</th><th>Вход</th><th>Цена</th><th>Размер $</th><th>SL</th><th>TP</th><th>Trail</th><th>Hold</th><th>uPnL</th><th></th></tr>
+      <tr><th>Symbol</th><th>Вход</th><th>Цена →</th><th>Размер $</th><th>SL</th><th>TP</th><th>DCA</th><th>Trail</th><th>Hold</th><th>Comm</th><th>Фандинг</th><th>uPnL</th><th>uNet</th><th></th></tr>
     </thead><tbody></tbody></table>
     <div class="muted" style="font-size:11px;margin-top:6px">uPnL — нереализованный PnL по текущей цене Bybit (real-time). Клик по строке — график.</div>
   </div>
@@ -454,7 +508,7 @@ tr:hover { background: #1e2329; cursor: pointer; }
 <div id="view-trades" class="hidden">
   <div class="card">
     <table id="trades-table"><thead>
-      <tr><th>Symbol</th><th>Side</th><th>Размер $</th><th>Вход</th><th>Выход</th><th>Move%</th><th>Hold</th><th>Net PnL</th><th>Reason</th><th>Дата</th></tr>
+      <tr><th>Symbol</th><th>Side</th><th>Размер $</th><th>Вход</th><th>Выход</th><th>Move%</th><th>Hold</th><th>PnL $</th><th>Comm</th><th>Фандинг</th><th>Net</th><th>Reason</th><th>Дата</th></tr>
     </thead><tbody></tbody></table>
   </div>
 </div>
@@ -469,7 +523,7 @@ tr:hover { background: #1e2329; cursor: pointer; }
       <div class="ctab" data-ctab="tv">📈 Анализ (TradingView)</div>
     </div>
     <div id="ctab-deal" class="ctab-panel">
-      <div id="chart-box"></div>
+      <div id="chart-box"><div id="chart-legend" class="chart-legend"></div><div id="chart-info" class="chart-info"></div><div id="ruler-btn" class="ruler-btn" title="Shift+drag или кликни кнопку">📏 Линейка</div></div>
     </div>
     <div id="ctab-tv" class="ctab-panel hidden">
       <div id="tv-chart"></div>
@@ -494,7 +548,7 @@ function badge(r) {
 }
 
 async function loadOverview() {
-  const d = await api('/api/overview');
+  const d = await api('api/overview');
   $('#s-balance').textContent = '$' + fmt(d.balance);
   $('#s-equity').textContent = '$' + fmt(d.equity);
   const pnl = d.equity - (d.config?.initial_balance||1000);
@@ -505,23 +559,74 @@ async function loadOverview() {
   $('#upd').textContent = 'обновлено ' + (d.updated||'')?.slice(11,19);
   const cfg = d.config||{};
   $('#cfg').innerHTML = Object.entries(cfg).map(([k,v])=>`<div class="stat"><span class="lbl">${k}</span><span class="val" style="font-size:15px">${v}</span></div>`).join('');
+  renderStrategy(cfg);
   // equity curve metrics
   const m = d.eq_metrics;
   if (m) {
     $('#eq-period').textContent = `· ${m.period_days} дн · ${m.points} точек`;
     const pfTxt = m.profit_factor!=null ? m.profit_factor.toFixed(2) : '—';
     const retCls = m.return_pct>=0 ? 'pos' : 'neg';
-    const ddCls = m.max_dd_pct>=0 ? 'neg' : 'pos';
     $('#eq-metrics').innerHTML = [
-      ['Return', `<span class="${retCls}">${m.return_pct>=0?'+':''}${m.return_pct}%</span>`, 'ret'],
-      ['Max DD', `<span class="${ddCls}">-${m.max_dd_pct}%</span>`, 'dd'],
-      ['Profit Factor', pfTxt, 'pf'],
-      ['Start', '$'+fmt(m.initial), 'init'],
-      ['Current', '$'+fmt(m.current), 'cur'],
+      ['Return', `<span class="${retCls}">${m.return_pct>=0?'+':''}${m.return_pct}%</span>`],
+      ['Max DD', `<span class="neg">-${m.max_dd_pct}%</span>`],
+      ['Profit Factor', pfTxt],
+      ['Start', '$'+fmt(m.initial)],
+      ['Current', '$'+fmt(m.current)],
     ].map(([k,v])=>`<div class="stat"><span class="lbl">${k}</span><span class="val">${v}</span></div>`).join('');
   }
   // equity curve
   drawEq(d.equity_curve);
+}
+function renderStrategy(c) {
+  const dcaOn = c.dca_enabled !== false;
+  const dcaMax = c.dca_max_count || 0;
+  const dcaTrig = c.dca_trigger_pct || 0;
+  const dcaMult = c.dca_qty_multiplier || 1;
+  const maxQty = (1 + dcaMax * dcaMult).toFixed(0);
+  const html = `
+    <div style="margin-bottom:10px">
+      <b style="color:#f0b90b">Сценарий Б:</b> Монета впервые становится #1 по росту за день →
+      откат на позицию #2 → <b>шорт #2</b>. Ловим откат после пампа.
+    </div>
+    <div style="margin-bottom:10px">
+      <b style="color:#f0b90b">Логика входа:</b><br>
+      • Ранжирование каждые ${c.ranking_interval_min||15} мин по росту за день<br>
+      • Монета была #1 → стала #2 → шортим #2<br>
+      • Фильтр: объём > $${(c.min_volume_usd||0).toLocaleString()}, BTC/ETH/SOL исключены<br>
+      • Бан монеты до конца дня после входа (не входить повторно)<br>
+      • Размер позиции: ${c.risk_pct||5}% депозита, макс ${c.max_open_positions||3} одновременно
+    </div>
+    <div style="margin-bottom:10px">
+      <b style="color:#f0b90b">Выход:</b><br>
+      • <b>TP</b> ${c.tp_pct||5}% — фиксация при падении на 5%<br>
+      • <b>SL</b> ${c.sl_pct||30}% — стоп при росте на 30% (широкий, на откат)<br>
+      • <b>Trail</b> ${c.trail_pct||3}% отступ, активация при падении ${c.activation_pct||1}%
+    </div>
+    <div style="margin-bottom:10px">
+      <b style="color:#f0b90b">DCA усреднение:</b> ${dcaOn ? '<span style="color:#0ecb81">ВКЛ</span>' : '<span style="color:#f6465d">ВЫКЛ</span>'}<br>
+      • Рост против шорта на ${dcaTrig}% → докупаем (повышаем avg entry)<br>
+      • Макс докупов: ${dcaMax} → позиция до ${maxQty}× от изначальной<br>
+      • Каждый DCA: ×${dcaMult} от оригинального qty<br>
+      • После DCA: SL/TP пересчитываются от новой средней<br>
+      • TP = avg - 5% → нужен откат 5% от повышенной средней
+    </div>
+    <div style="margin-bottom:10px">
+      <b style="color:#f0b90b">Исполнение:</b> Market ордера (paper trading)<br>
+      • Комиссия: ${c.commission_taker_pct||0.055}% taker RT (entry + DCA + close)<br>
+      • Slippage: ${c.slippage_pct||0.02}% на вход и выход<br>
+      • Фандинг: реальный Bybit, интервал per-symbol (1ч/2ч/4ч/8ч)
+    </div>
+    <div>
+      <b style="color:#f0b90b">Риск-менеджмент:</b><br>
+      • Заявленный risk: ${c.risk_pct||5}% на сделку = $${(c.risk_pct||5)*(c.initial_balance||1000)/100}<br>
+      • Notional позиции: $${((c.risk_pct||5)*(c.initial_balance||1000)/100/((c.sl_pct||30)/100)).toFixed(0)}
+      → после DCA×${dcaMax}: $${((c.risk_pct||5)*(c.initial_balance||1000)/100/((c.sl_pct||30)/100)*(1+dcaMax*dcaMult)).toFixed(0)}<br>
+      • <b style="color:#f6465d">Убыток на SL после DCA: ~$${((c.risk_pct||5)*(c.initial_balance||1000)/100*(1+dcaMax*dcaMult)).toFixed(0)}
+      = ~${((c.risk_pct||5)*(1+dcaMax*dcaMult)).toFixed(0)}% депозита</b><br>
+      • Два SL подряд = ~${((c.risk_pct||5)*(1+dcaMax*dcaMult)*2).toFixed(0)}% депозита
+    </div>`;
+  const el = $('#strategy-desc');
+  if (el) el.innerHTML = html;
 }
 
 function drawEq(pts) {
@@ -538,41 +643,51 @@ function drawEq(pts) {
 }
 
 async function loadOpen() {
-  const d = await api('/api/open');
+  const d = await api('api/open');
   const tb = $('#open-table tbody'); tb.innerHTML = '';
-  if (!d.open.length) { tb.innerHTML = '<tr><td colspan="9" class="muted">нет открытых позиций</td></tr>'; return; }
+  if (!d.open.length) { tb.innerHTML = '<tr><td colspan="14" class="muted">нет открытых позиций</td></tr>'; return; }
   for (const p of d.open) {
     const tr = document.createElement('tr');
     tr.onclick = () => openDetail(p.id);
+    const dcaBadge = p.dca_count > 0 ? `<span class="badge tp">DCA×${p.dca_count}</span>` : `<span class="muted">0/${p.dca_max_count||0}</span>`;
+    const dcaTrig = p.dca_trigger_price ? `<div class="muted" style="font-size:11px">trig ${fmt(p.dca_trigger_price,4)}</div>` : '';
     tr.innerHTML = `<td><b>${p.symbol}</b> <span class="badge short">${p.side}</span></td>
       <td>${p.entry_str}</td>
       <td>${fmt(p.entry_price, 6)}${p.last_price?` → <span class="muted">${fmt(p.last_price,6)}</span>`:''}</td>
       <td><b>$${fmt(p.notional,0)}</b> <span class="muted">${fmt(p.qty,2)}</span></td>
-      <td class="neg">${fmt(p.sl_price,6)}</td>
-      <td class="pos">${fmt(p.tp_price,6)}</td>
+      <td class="neg">${fmt(p.sl_price,6)}${p.dist_to_sl!=null?`<div class="muted" style="font-size:10px">+${pct(p.dist_to_sl)}</div>`:''} </td>
+      <td class="pos">${fmt(p.tp_price,6)}${p.dist_to_tp!=null?`<div class="muted" style="font-size:10px">${pct(p.dist_to_tp)}</div>`:''} </td>
+      <td>${dcaBadge}${dcaTrig}${p.dist_to_dca!=null?`<div class="muted" style="font-size:10px">→ +${pct(p.dist_to_dca)}</div>`:''} </td>
       <td>${p.activated?'✅':'⏳'} ${p.trail_pct}% ${p.min_price?fmt(p.min_price,6):''}</td>
       <td>${p.hold_str}</td>
+      <td class="muted">$${fmt(p.commission_paid)}</td>
+      <td class="${pnlCls(p.funding_paid||0)}">${p.funding_paid>=0?'+':''}$${fmt(p.funding_paid)}</td>
       <td class="${pnlCls(p.u_pnl||0)}">${p.u_pnl!=null?(p.u_pnl>=0?'+':'')+'$'+fmt(p.u_pnl)+' <span class="muted">('+pct(p.u_pnl_pct)+')</span>':'—'}</td>
+      <td class="${pnlCls(p.u_net_pnl||0)}"><b>${p.u_net_pnl!=null?(p.u_net_pnl>=0?'+':'')+'$'+fmt(p.u_net_pnl):'—'}</b></td>
       <td><span class="badge open">OPEN</span></td>`;
     tb.appendChild(tr);
   }
 }
 
 async function loadTrades() {
-  const d = await api('/api/trades');
+  const d = await api('api/trades');
   const tb = $('#trades-table tbody'); tb.innerHTML = '';
-  if (!d.trades.length) { tb.innerHTML = '<tr><td colspan="10" class="muted">нет закрытых сделок</td></tr>'; return; }
+  if (!d.trades.length) { tb.innerHTML = '<tr><td colspan="13" class="muted">нет закрытых сделок</td></tr>'; return; }
   for (const t of d.trades) {
     const tr = document.createElement('tr');
     tr.onclick = () => openDetail(t.id);
-    tr.innerHTML = `<td><b>${t.symbol}</b></td>
+    const dcaBadge = t.dca_count > 0 ? ` <span class="badge tp" style="font-size:9px">DCA×${t.dca_count}</span>` : '';
+    tr.innerHTML = `<td><b>${t.symbol}</b>${dcaBadge}</td>
       <td><span class="badge short">${t.side}</span></td>
       <td><b>$${fmt(t.notional,0)}</b></td>
       <td>${fmt(t.entry_price,6)}</td>
       <td>${fmt(t.exit_price,6)}</td>
       <td>${pct(t.move_pct)}</td>
       <td>${t.hold_str}</td>
-      <td class="${pnlCls(t.net_pnl)}">${t.net_pnl>=0?'+':''}$${fmt(t.net_pnl)}</td>
+      <td class="${pnlCls(t.pnl)}">${t.pnl>=0?'+':''}$${fmt(t.pnl)}</td>
+      <td class="muted">$${fmt(t.commission)}</td>
+      <td class="${pnlCls(t.funding)}">${t.funding>=0?'+':''}$${fmt(t.funding)}</td>
+      <td class="${pnlCls(t.net_pnl)}"><b>${t.net_pnl>=0?'+':''}$${fmt(t.net_pnl)}</b></td>
       <td>${badge(t.reason)}</td>
       <td class="muted">${t.date||''}</td>`;
     tb.appendChild(tr);
@@ -581,7 +696,7 @@ async function loadTrades() {
 
 async function openDetail(id) {
   showView('detail');
-  const d = await api('/api/chart?id=' + encodeURIComponent(id));
+  const d = await api('api/chart?id=' + encodeURIComponent(id));
   if (d.error) { $('#d-title').textContent = 'Ошибка: ' + d.error; return; }
   const t = d.trade, sym = d.symbol;
   $('#d-title').innerHTML = `${sym} <span class="badge short">${t.side}</span> ${badge(t.reason)}`;
@@ -590,6 +705,11 @@ async function openDetail(id) {
   // info
   const move = t.exit_price ? pct(((t.exit_price - t.entry_price)/t.entry_price)*100) : '—';
   const net = t.net_pnl!=null ? `<span class="${pnlCls(t.net_pnl)}">${t.net_pnl>=0?'+':''}$${fmt(t.net_pnl)}</span>` : '—';
+  const dcaInfo = t.dca_events && t.dca_events.length
+    ? '<div style="margin-top:6px"><b style="color:#9c6ade">DCA усреднения:</b> ' +
+      t.dca_events.map(d => 'DCA#'+d.n+' @'+fmt(d.fill,4)+' avg '+fmt(d.avg_before,4)+'→'+fmt(d.avg_after,4)+' qty='+fmt(d.qty_total,2)).join(' · ') +
+      '</div>'
+    : '';
   $('#d-info').innerHTML = [
     ['Вход', fmt(t.entry_price,6)], ['Выход', t.exit_price?fmt(t.exit_price,6):'—'],
     ['SL', fmt(t.sl_price,6)], ['TP', fmt(t.tp_price,6)],
@@ -598,56 +718,358 @@ async function openDetail(id) {
     ['Время входа', t.entry_str||fmt_ts(t.entry_ts)], ['Время выхода', t.exit_str||'—'],
     ['Hold', t.hold_str||'—'], ['Комиссия', t.commission!=null?'$'+fmt(t.commission):'—'],
     ['Фандинг', t.funding!=null?'$'+fmt(t.funding):'—'], ['Размер позиции', (t.notional!=null?'$'+fmt(t.notional,0):'—') + (t.qty!=null?' · '+fmt(t.qty,4)+' ед':'')],
-  ].map(([k,v])=>`<div class="stat"><span class="lbl">${k}</span><span class="val" style="font-size:14px">${v}</span></div>`).join('');
+  ].map(([k,v])=>`<div class="stat"><span class="lbl">${k}</span><span class="val" style="font-size:14px">${v}</span></div>`).join('') + dcaInfo;
 }
 
 function fmt_ts(ts){ if(!ts) return '—'; const d=new Date(ts*1000); return d.toISOString().slice(0,16).replace('T',' ')+' UTC'; }
 
 function drawChart(candles, t) {
   drawDealChart(candles, t);
-  drawTVChart(t);
+  // TV widget создаётся только при переключении на вкладку "Анализ"
+}
+
+// ── Measure Tool Plugin (линейка как на TradingView) ──
+class MeasureToolPlugin {
+  constructor() {
+    this._chart = null; this._series = null;
+    this._paneViews = [new MeasureToolPaneView(this)];
+    this.startPoint = null; this.endPoint = null; this.isActive = false;
+  }
+  attached({ chart, series }) { this._chart = chart; this._series = series; }
+  detached() { this._chart = null; this._series = null; }
+  updateAllViews() { this._paneViews.forEach(v => v.update()); }
+  paneViews() { return this._paneViews; }
+  setData(start, end) {
+    this.startPoint = start; this.endPoint = end;
+    this.isActive = !!(start && end);
+    // v4: requestUpdate для перерисовки примитивов
+    if (this._chart) { try { this._chart.requestUpdate(); } catch(e) { try { this._series.applyOptions({}); } catch(e2) {} } }
+  }
+}
+
+class MeasureToolPaneView {
+  constructor(source) { this._source = source; this._renderer = new MeasureToolRenderer(source); }
+  update() {}
+  zOrder() { return 'top'; }
+  renderer() { return this._source.isActive ? this._renderer : null; }
+}
+
+class MeasureToolRenderer {
+  constructor(source) { this._source = source; }
+  draw(ctx) {
+    const { startPoint, endPoint, _series, _chart } = this._source;
+    if (!startPoint || !endPoint) return;
+    const ts = _chart.timeScale();
+    // timeToCoordinate returns null if time not exactly in data
+    // Use logicalToCoordinate: find nearest candle index via binary search
+    const data = _series.data();
+    const findLogical = (t) => {
+      let lo = 0, hi = data.length - 1, best = 0, bestDiff = Infinity;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        const diff = Math.abs(data[mid].time - t);
+        if (diff < bestDiff) { bestDiff = diff; best = mid; }
+        if (data[mid].time < t) lo = mid + 1;
+        else hi = mid - 1;
+      }
+      return best;
+    };
+    const x1 = ts.logicalToCoordinate(findLogical(startPoint.time));
+    const x2 = ts.logicalToCoordinate(findLogical(endPoint.time));
+    const y1 = _series.priceToCoordinate(startPoint.price);
+    const y2 = _series.priceToCoordinate(endPoint.price);
+    if (x1 === null || x2 === null || y1 === null || y2 === null) return;
+
+    ctx.save();
+    // Selection rectangle
+    ctx.fillStyle = 'rgba(240,185,11,0.12)';
+    ctx.strokeStyle = '#f0b90b';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 3]);
+    const rx = Math.min(x1, x2), ry = Math.min(y1, y2);
+    const rw = Math.abs(x2 - x1), rh = Math.abs(y2 - y1);
+    ctx.fillRect(rx, ry, rw, rh);
+    ctx.strokeRect(rx, ry, rw, rh);
+    ctx.setLineDash([]);
+
+    // Calculate stats
+    const priceDiff = endPoint.price - startPoint.price;
+    const pctDiff = (priceDiff / startPoint.price) * 100;
+    // Bars count via logical range
+    let bars = Math.abs(findLogical(endPoint.time) - findLogical(startPoint.time));
+    // Time diff
+    let timeStr = '';
+    if (startPoint.time && endPoint.time) {
+      const diffSec = Math.abs(endPoint.time - startPoint.time);
+      if (diffSec < 60) timeStr = diffSec + 'с';
+      else if (diffSec < 3600) timeStr = Math.floor(diffSec/60) + 'м ' + (diffSec%60) + 'с';
+      else if (diffSec < 86400) timeStr = Math.floor(diffSec/3600) + 'ч ' + Math.floor((diffSec%3600)/60) + 'м';
+      else timeStr = Math.floor(diffSec/86400) + 'д ' + Math.floor((diffSec%86400)/3600) + 'ч';
+    }
+
+    const sign = priceDiff > 0 ? '+' : '';
+    const lines = [
+      sign + priceDiff.toFixed(6) + ' (' + (pctDiff > 0 ? '+' : '') + pctDiff.toFixed(2) + '%)',
+      bars + ' баров · ' + timeStr
+    ];
+
+    // Label box
+    const textX = (x1 + x2) / 2;
+    const textY = Math.max(y1, y2) + 8;
+    const rectW = 150, rectH = 42;
+    ctx.fillStyle = '#1e222d';
+    ctx.strokeStyle = '#f0b90b';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    let bx = textX - rectW/2, by = textY;
+    // Keep box in view
+    if (bx < 2) bx = 2;
+    if (bx + rectW > ts.width() - 60) bx = ts.width() - 60 - rectW;
+    if (by + rectH > _chart.priceScale('right').height() - 2) by = Math.min(y1,y2) - rectH - 8;
+    ctx.roundRect(bx, by, rectW, rectH, 5);
+    ctx.fill(); ctx.stroke();
+
+    // Text
+    ctx.fillStyle = '#f0b90b';
+    ctx.font = 'bold 12px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(lines[0], bx + rectW/2, by + 15);
+    ctx.fillStyle = '#848e9c';
+    ctx.font = '11px monospace';
+    ctx.fillText(lines[1], bx + rectW/2, by + 30);
+    ctx.restore();
+  }
 }
 
 // ── Вкладка "Сделка": lightweight-charts с маркерами entry/exit и линиями SL/TP ──
 function drawDealChart(candles, t) {
   if (chart) { chart.remove(); chart=null; series=null; }
   const box = $('#chart-box');
+  const legend = box.querySelector('#chart-legend');
+  const info = box.querySelector('#chart-info');
+  const rbtn = box.querySelector('#ruler-btn');
   box.innerHTML = '';
+  if (legend) box.appendChild(legend);
+  if (info) box.appendChild(info);
+  if (rbtn) box.appendChild(rbtn);
+
   chart = LightweightCharts.createChart(box, {
-    height: 500, layout: {background:{color:'#0b0e11'},textColor:'#848e9c'},
-    grid: {vertLines:{color:'#1e2329'},horzLines:{color:'#1e2329'}},
-    rightPriceScale: {visible:true}, timeScale: {timeVisible:true, secondsVisible:true},
-    crosshair: {mode: 0},
+    height: 520, autoSize: true,
+    layout: {background:{color:'#0b0e11'},textColor:'#d1d4dc',fontSize:11,fontFamily:'monospace'},
+    grid: {vertLines:{color:'rgba(30,35,41,0.5)'},horzLines:{color:'rgba(30,35,41,0.5)'}},
+    rightPriceScale: {visible:true,borderColor:'#1e2329',scaleMargins:{top:0.08,bottom:0.08}},
+    timeScale: {visible:true,borderColor:'#1e2329',timeVisible:true,secondsVisible:false},
+    crosshair: {
+      mode: 0,
+      vertLine: {color:'#848e9c',width:1,style:3,labelBackgroundColor:'#363a45'},
+      horzLine: {color:'#848e9c',width:1,style:3,labelBackgroundColor:'#363a45'}
+    },
   });
+
+  // Price precision from data
+  const minPrice = Math.min(...candles.map(c=>c.l));
+  let precision = 2, minMove = 0.01;
+  if (minPrice < 0.001) { precision = 6; minMove = 0.000001; }
+  else if (minPrice < 1) { precision = 5; minMove = 0.00001; }
+  else if (minPrice < 100) { precision = 4; minMove = 0.0001; }
+  else { precision = 2; minMove = 0.01; }
+
   series = chart.addCandlestickSeries({
     upColor:'#0ecb81',downColor:'#f6465d',borderUpColor:'#0ecb81',borderDownColor:'#f6465d',
-    wickUpColor:'#0ecb81',wickDownColor:'#f6465d', priceFormat:{type:'price',precision:6,minMove:0.000001},
+    wickUpColor:'#0ecb81',wickDownColor:'#f6465d',
+    priceFormat:{type:'price',precision:precision,minMove:minMove},
   });
   series.setData(candles.map(c=>({time:Math.floor(c.t),open:c.o,high:c.h,low:c.l,close:c.c})));
 
-  // горизонтальные линии: entry / SL / TP / exit / min
+  const e = t.entry_price;
+  const pctV = (p) => p && e ? ((p/e - 1) * 100).toFixed(1) + '%' : '';
+  const fmtP = (p) => p != null ? fmt(p, precision) : '—';
+
+  // All price levels — ordered top (highest) to bottom (lowest)
+  const levels = [
+    {key:'SL', price: t.sl_price, color: '#f6465d', dashed: true, axisLabel: true, title: 'SL'},
+    {key:'DCA', price: t.dca_trigger_price, color: '#9c6ade', dashed: true, axisLabel: false, title: 'D'},
+    {key:'ORIG', price: (t.original_entry && Math.abs(t.original_entry - t.entry_price) > 0.000001) ? t.original_entry : null, color: '#848e9c', dashed: true, axisLabel: false, title: 'O'},
+    {key:'ENTRY', price: t.entry_price, color: '#f0b90b', dashed: false, axisLabel: true, title: 'E', lw: 2},
+    {key:'EXIT', price: t.exit_price, color: '#4a9eff', dashed: false, axisLabel: false, title: 'X'},
+    {key:'TP', price: t.tp_price, color: '#0ecb81', dashed: true, axisLabel: true, title: 'TP'},
+    {key:'MIN', price: t.min_price, color: '#5e6b85', dashed: true, axisLabel: false, title: 'M'},
+  ];
+
+  // Price lines — short titles, axisLabel only for ENTRY/SL/TP
+  for (const L of levels) {
+    if (L.price == null) continue;
+    series.createPriceLine({
+      price: L.price, color: L.color,
+      lineWidth: L.lw || 1, lineStyle: L.dashed ? 2 : 0,
+      axisLabelVisible: L.axisLabel, title: L.title
+    });
+  }
+
+  // Legend overlay — full info with prices + percentages
+  let legHtml = '';
+  for (const L of levels) {
+    if (L.price == null) continue;
+    const p = pctV(L.price);
+    const dotStyle = L.dashed ? 'border-top: 2px dashed ' + L.color + '; background: transparent;' : 'background: ' + L.color + ';';
+    legHtml += '<div class="lg-row"><span class="lg-dot" style="' + dotStyle + '"></span><span class="lg-label" style="color:' + L.color + '">' + L.key + '</span><span class="lg-price">' + fmtP(L.price) + '</span><span class="lg-pct">' + p + '</span></div>';
+  }
+  if (legend) legend.innerHTML = legHtml;
+
+  // Info overlay — symbol + hold + pnl
+  const reasonStr = t.reason ? t.reason.toUpperCase() : 'OPEN';
+  const netStr = t.net_pnl != null ? (t.net_pnl >= 0 ? '+' : '') + '$' + fmt(t.net_pnl) : '—';
+  const netColor = t.net_pnl != null ? (t.net_pnl >= 0 ? '#0ecb81' : '#f6465d') : '#848e9c';
+  if (info) info.innerHTML = '<b style="color:#f0b90b">' + t.symbol + '</b> · ' + (t.hold_str||'—') + ' · <span style="color:' + netColor + '">' + netStr + '</span> · ' + reasonStr;
+
+  // Markers entry/exit/DCA
   const entryT = Math.floor(t.entry_ts);
   const exitT = t.exit_ts ? Math.floor(t.exit_ts) : Math.floor(Date.now()/1000);
-  const lines = [
-    {price: t.entry_price, color: '#f0b90b', title: 'ENTRY', dashed: false},
-    {price: t.sl_price, color: '#f6465d', title: 'SL', dashed: true},
-    {price: t.tp_price, color: '#0ecb81', title: 'TP', dashed: true},
-  ];
-  if (t.exit_price) lines.push({price: t.exit_price, color: '#4a9eff', title: 'EXIT', dashed: false});
-  if (t.min_price) lines.push({price: t.min_price, color: '#848e9c', title: 'MIN', dashed: true});
-  for (const L of lines) {
-    if (L.price==null) continue;
-    series.createPriceLine({price: L.price, color: L.color, lineWidth: 1, lineStyle: L.dashed?2:0, axisLabelVisible: true, title: L.title});
-  }
-  // маркеры entry/exit на оси времени
-  const qtyStr = t.qty != null ? ' · ' + fmt(t.qty, 4) : '';
-  const notionalStr = t.notional != null ? ' · $' + fmt(t.notional, 0) : '';
   const markers = [
-    {time: entryT, position: 'aboveBar', color: '#f0b90b', shape: 'arrowDown', text: 'ENTRY' + notionalStr + qtyStr},
+    {time: entryT, position: 'aboveBar', color: '#f0b90b', shape: 'arrowDown', text: 'ENTRY'},
   ];
+  if (t.dca_events && t.dca_events.length) {
+    for (const d of t.dca_events) {
+      markers.push({time: Math.floor(d.ts), position: 'aboveBar', color: '#9c6ade', shape: 'circle', text: 'DCA#' + d.n});
+    }
+  }
   if (t.exit_ts) markers.push({time: exitT, position: 'belowBar', color: '#4a9eff', shape: 'arrowUp', text: t.reason?.toUpperCase()||'EXIT'});
   try { series.setMarkers(markers); } catch(e) {}
+
+  // Crosshair tooltip — OHLC on hover
+  chart.subscribeCrosshairMove(param => {
+    if (!param.time || !param.seriesData) return;
+    const d = param.seriesData.get(series);
+    if (d && info) {
+      info.innerHTML = '<b style="color:#f0b90b">' + t.symbol + '</b> O:' + fmt(d.open,precision) + ' H:' + fmt(d.high,precision) + ' L:' + fmt(d.low,precision) + ' C:' + fmt(d.close,precision);
+    }
+  });
+
   chart.timeScale().fitContent();
+
+  // ── Линейка: HTML overlay, anchored to time/price ──
+  if (window._rulerCleanup) window._rulerCleanup();
+
+  // Store start/end as {time, price} so ruler stays anchored when chart scrolls/zooms
+  let rulerStage = 0, rulerStart = null, rulerEnd = null;
+  let rulerOverlay = box.querySelector('#ruler-overlay');
+  if (!rulerOverlay) {
+    rulerOverlay = document.createElement('div');
+    rulerOverlay.id = 'ruler-overlay';
+    rulerOverlay.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;z-index:15;pointer-events:none;display:none';
+    box.appendChild(rulerOverlay);
+  }
+  const btn = box.querySelector('#ruler-btn');
+
+  const resetRuler = () => {
+    rulerStage = 0; rulerStart = null; rulerEnd = null;
+    rulerOverlay.style.display = 'none';
+    rulerOverlay.innerHTML = '';
+    if (btn) btn.classList.remove('active');
+  };
+
+  if (btn) {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      if (btn.classList.contains('active')) { resetRuler(); }
+      else { btn.classList.add('active'); }
+    };
+  }
+  const isActive = () => btn.classList.contains('active');
+
+  // Convert pixel → {time, price}
+  const pxToTP = (x, y) => {
+    const ts = chart.timeScale();
+    const time = ts.coordinateToTime(x);
+    const price = series.coordinateToPrice(y);
+    return (time != null && price != null) ? { time, price } : null;
+  };
+
+  // Convert {time, price} → pixel
+  const tpToPx = (tp) => {
+    if (!tp) return null;
+    const ts = chart.timeScale();
+    const x = ts.logicalToCoordinate(findLogical(tp.time));
+    const y = series.priceToCoordinate(tp.price);
+    return (x != null && y != null) ? { x, y } : null;
+  };
+
+  // Binary search nearest candle index
+  const findLogical = (t) => {
+    const data = series.data();
+    let lo = 0, hi = data.length - 1, best = 0, bd = Infinity;
+    while (lo <= hi) { const m = (lo+hi)>>1; const d = Math.abs(data[m].time - t); if (d < bd) { bd = d; best = m; } if (data[m].time < t) lo = m+1; else hi = m-1; }
+    return best;
+  };
+
+  // Render ruler from rulerStart/rulerEnd (anchored to time/price)
+  const renderRuler = () => {
+    if (!rulerStart) return;
+    const end = rulerEnd || rulerStart;
+    const p1 = tpToPx(rulerStart), p2 = tpToPx(end);
+    if (!p1 || !p2) { rulerOverlay.innerHTML = ''; return; }
+    const x1 = Math.min(p1.x, p2.x), y1 = Math.min(p1.y, p2.y);
+    const w = Math.abs(p2.x - p1.x), h = Math.abs(p2.y - p1.y);
+    // Label
+    const priceDiff = end.price - rulerStart.price;
+    const pct = (priceDiff / rulerStart.price) * 100;
+    const data = series.data();
+    const bars = Math.abs(findLogical(end.time) - findLogical(rulerStart.time));
+    const dSec = Math.abs(end.time - rulerStart.time);
+    const tStr = dSec<60?dSec+'с':dSec<3600?Math.floor(dSec/60)+'м':dSec<86400?Math.floor(dSec/3600)+'ч '+Math.floor((dSec%3600)/60)+'м':Math.floor(dSec/86400)+'д';
+    const labelText = (priceDiff>=0?'+':'')+priceDiff.toFixed(6)+' ('+(pct>=0?'+':'')+pct.toFixed(2)+'%) · '+bars+' баров · '+tStr;
+    rulerOverlay.innerHTML = '<div style="position:absolute;left:'+x1+'px;top:'+y1+'px;width:'+w+'px;height:'+h+'px;border:1px dashed #f0b90b;background:rgba(240,185,11,0.12)"></div><div style="position:absolute;left:'+(x1+w/2-90)+'px;top:'+(y1+h+4)+'px;background:#1e222d;border:1px solid #f0b90b;border-radius:5px;padding:4px 10px;color:#f0b90b;font:bold 11px monospace;white-space:nowrap">'+labelText+'</div>';
+  };
+
+  // click — start / end
+  const onClick = (e) => {
+    if (!isActive() && !e.shiftKey) { resetRuler(); return; }
+    e.stopPropagation();
+    const rect = box.getBoundingClientRect();
+    const tp = pxToTP(e.clientX - rect.left, e.clientY - rect.top);
+    if (!tp) return;
+    if (rulerStage === 0 || rulerStage === 2) {
+      if (rulerStage === 2) { rulerOverlay.innerHTML = ''; }
+      rulerStage = 1; rulerStart = tp; rulerEnd = null;
+      rulerOverlay.style.display = 'block';
+      renderRuler();
+    } else if (rulerStage === 1) {
+      rulerEnd = tp; rulerStage = 2;
+      renderRuler();
+    }
+  };
+
+  // mousemove — preview (stage 1)
+  const onMove = (e) => {
+    if (!isActive() && !e.shiftKey) return;
+    if (rulerStage !== 1) return;
+    const rect = box.getBoundingClientRect();
+    const tp = pxToTP(e.clientX - rect.left, e.clientY - rect.top);
+    if (!tp) return;
+    rulerEnd = tp;
+    renderRuler();
+  };
+
+  const onKey = (e) => { if (e.key === 'Escape') resetRuler(); };
+
+  box.addEventListener('click', onClick);
+  box.addEventListener('mousemove', onMove);
+  window.addEventListener('keydown', onKey);
+
+  // Re-render on chart scroll/zoom — subscribeCrosshairMove fires on pan
+  const onXH = () => { if (rulerStage >= 1) renderRuler(); };
+  chart.subscribeCrosshairMove(onXH);
+  // Also on visible range change
+  const onScale = () => { if (rulerStage >= 1) renderRuler(); };
+  chart.timeScale().subscribeVisibleLogicalRangeChange(onScale);
+
+  window._rulerCleanup = () => {
+    box.removeEventListener('click', onClick);
+    box.removeEventListener('mousemove', onMove);
+    window.removeEventListener('keydown', onKey);
+    try { chart.timeScale().unsubscribeVisibleLogicalRangeChange(onScale); } catch(e) {}
+  };
 }
 
 // ── Вкладка "Анализ": TradingView со всеми инструментами ──
@@ -709,9 +1131,13 @@ document.addEventListener('click', e => {
   document.querySelectorAll('.ctab').forEach(t=>t.classList.toggle('active', t===c));
   document.querySelectorAll('.ctab-panel').forEach(p=>p.classList.add('hidden'));
   $('#ctab-'+c.dataset.ctab).classList.remove('hidden');
-  // при переключении на lightweight-charts вкладку — resize (график мог быть скрыт)
-  if (c.dataset.ctab === 'deal' && chart) {
-    setTimeout(() => { try { chart.applyOptions({width: $('#chart-box').clientWidth, height: 500}); chart.timeScale().fitContent(); } catch(e){} }, 50);
+  // при переключении на lightweight-charts — убрать TV iframe (фикс наложения графиков)
+  if (c.dataset.ctab === 'deal') {
+    const tvBox = $('#tv-chart');
+    if (tvBox) tvBox.innerHTML = '';
+    if (chart) {
+      setTimeout(() => { try { chart.applyOptions({width: $('#chart-box').clientWidth, height: 500}); chart.timeScale().fitContent(); } catch(e){} }, 50);
+    }
   }
   // при переключении на TradingView — пересоздать виджет (иначе iframe 0 высоты из-за скрытого контейнера)
   if (c.dataset.ctab === 'tv' && window._currentTrade) {
@@ -732,9 +1158,25 @@ async def index(req):
     return web.Response(text=HTML, content_type="text/html")
 
 
+async def tv_page(request):
+    """TradingView графики сделок"""
+    p = Path(__file__).parent / "tv_charts.html"
+    if not p.exists():
+        return web.Response(text="tv_charts.html not found", status=404)
+    return web.FileResponse(p, headers={"Content-Type": "text/html; charset=utf-8"})
+
+async def charts_page(request):
+    """Отдать интерактивные графики сделок"""
+    chart_path = Path(__file__).parent / "charts.html"
+    if not chart_path.exists():
+        return web.Response(text="charts.html not found", status=404)
+    return web.FileResponse(chart_path, headers={"Content-Type": "text/html; charset=utf-8"})
+
 async def main():
     app = web.Application()
     app.router.add_get("/", index)
+    app.router.add_get("/charts", charts_page)
+    app.router.add_get("/tv", tv_page)
     app.router.add_get("/api/overview", api_overview)
     app.router.add_get("/api/open", api_open)
     app.router.add_get("/api/trades", api_trades)
