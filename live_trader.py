@@ -211,6 +211,103 @@ def _set_tp_order(symbol, qty, trigger_price, order_link_id=""):
     return d["result"].get("orderId")
 
 
+def restore_positions_from_exchange(existing_symbols):
+    """
+    Автовосстановление позиций с биржи при старте.
+    Если на Bybit есть позиция, а в existing_symbols её нет — подхватываем.
+    Возвращает list восстановленных позиций.
+    """
+    import hashlib, hmac, json, time, urllib.request
+    api_file = os.path.expanduser("~/.bybit_api")
+    if not os.path.exists(api_file):
+        api_file = "/root/.bybit_api"
+    if not os.path.exists(api_file):
+        return []
+    key, secret = open(api_file).read().strip().split("\n")
+    ts = str(int(time.time() * 1000)); recv = "5000"
+    params = "category=linear&settleCoin=USDT"
+    q = f"{ts}{key}{recv}{params}"
+    sign = hmac.new(secret.encode(), q.encode(), hashlib.sha256).hexdigest()
+    url = f"https://api.bybit.com/v5/position/list?{params}"
+    req = urllib.request.Request(url, headers={
+        "X-BAPI-SIGN-TYPE": "SHA256", "X-BAPI-SIGN": sign,
+        "X-BAPI-API-KEY": key, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv,
+    })
+    try:
+        d = json.loads(urllib.request.urlopen(req, timeout=10).read())
+    except Exception as e:
+        log.error(f"[restore] API ошибка: {e}")
+        return []
+
+    restored = []
+    for p in d.get("result", {}).get("list", []):
+        if float(p["size"]) == 0:
+            continue
+        sym = p["symbol"]
+        if sym in existing_symbols:
+            continue  # уже есть в state
+
+        avg = float(p["avgPrice"])
+        size = float(p["size"])
+        # Определить сколько DCA исполнено: ratio = size / original_qty
+        # original_qty = size / (dca_count + 1). Если size = orig → 0, 2×orig → 1...
+        # Нужно найти orig_qty. Если позиция без DCA — orig = size.
+        # Эвристика: считаем что DCA×N исполнен если size кратен с допуском
+        # Проще: dca_count = round(size/orig - 1), но orig неизвестен.
+        # Берём из DCA лимиток — qty лимитки = orig_qty
+        orders = get_open_orders(sym)
+        orig_qty = size
+        dca_count = 0
+        for o in orders:
+            if o.get("orderType") == "Limit":
+                lq = float(o.get("qty", 0))
+                if lq > 0 and lq < size:
+                    orig_qty = lq
+                    dca_count = round(size / orig_qty) - 1
+                    if dca_count < 0:
+                        dca_count = 0
+                    break
+
+        final_sl = calc_final_sl(avg, orig_qty)
+        tp = calc_tp(dca_count, avg)
+
+        # Найти SL/TP order IDs
+        sl_oid = tp_oid = None
+        dca_order_ids = {}
+        levels = calc_dca_levels(avg, orig_qty)
+        for o in orders:
+            if o.get("stopOrderType") == "Stop":
+                dir_ = str(o.get("triggerDirection", "0"))
+                if dir_ == "1":
+                    sl_oid = o["orderId"]
+                elif dir_ == "2":
+                    tp_oid = o["orderId"]
+            elif o.get("orderType") == "Limit":
+                op = float(o.get("price", 0))
+                for lvl in levels:
+                    if lvl["level"] > dca_count and abs(op - lvl["fill_price"]) < avg * 0.002:
+                        dca_order_ids[lvl["level"]] = o["orderId"]
+
+        pos = {
+            "id": f"{sym}_restore_{int(time.time())}",
+            "symbol": sym, "side": "short",
+            "entry_price": avg, "qty": size, "original_qty": orig_qty,
+            "notional": size * avg, "entry_ts": time.time(),
+            "original_entry": avg,
+            "sl_price": final_sl, "sl_order_id": sl_oid,
+            "tp_price": tp, "tp_order_id": tp_oid,
+            "dca_count": dca_count, "dca_max_count": DCA_MAX,
+            "dca_order_ids": dca_order_ids,
+            "dca_levels": levels, "final_sl_set": dca_count >= DCA_MAX,
+            "sl_synced": True, "open_day": time.strftime("%Y-%m-%d", time.gmtime()),
+            "live": True,
+        }
+        restored.append(pos)
+        log.info(f"[restore] подхватил {sym} size={size} dca×{dca_count} SL=${final_sl:.6f}")
+
+    return restored
+
+
 def sync_position(pos):
     """
     Синхронизация с биржей:

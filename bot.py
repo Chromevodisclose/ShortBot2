@@ -654,12 +654,36 @@ def load_positions():
         STATE.balance = float(data.get("balance", STATE.balance))
         STATE.equity = float(data.get("equity", STATE.balance))
         STATE.closed_today = int(data.get("closed_today", 0))
+        # ── АВТОВОССТАНОВЛЕНИЕ с биржи (LIVE) — даже если positions.json пустой ──
+        if LIVE_MODE:
+            restored = live_trader.restore_positions_from_exchange(set())
+            if restored:
+                STATE.open_positions.extend(restored)
+                log.info(f"[restore] автовосстановлено {len(restored)} позиций с биржи")
+                save_positions()
+            bal = live_trader.get_balance()
+            if bal and bal > 0:
+                STATE.balance = bal
         return
     # восстанавливаем позиции
     STATE.balance = float(data.get("balance", STATE.balance))
     STATE.equity = float(data.get("equity", STATE.balance))
     STATE.closed_today = int(data.get("closed_today", 0))
     STATE.open_positions = open_pos
+
+    # ── АВТОВОССТАНОВЛЕНИЕ с биржи (LIVE mode) ──
+    # Если на Bybit есть позиции, а в state нет — подхватываем
+    if LIVE_MODE:
+        existing = {p["symbol"] for p in STATE.open_positions if p.get("symbol")}
+        restored = live_trader.restore_positions_from_exchange(existing)
+        if restored:
+            STATE.open_positions.extend(restored)
+            log.info(f"[restore] автовосстановлено {len(restored)} позиций с биржи")
+            save_positions()
+        # Также обновим баланс с биржи
+        bal = live_trader.get_balance()
+        if bal and bal > 0:
+            STATE.balance = bal
     # traded_today — монеты по которым уже входили (чтобы не входить повторно)
     STATE.traded_today = {p["symbol"] for p in open_pos}
     log.info(f"load_positions: восстановлено {len(open_pos)} позиций, balance=${STATE.balance:.2f}, "
