@@ -383,6 +383,244 @@ async def api_chart(req):
     })
 
 
+# ═══════════════════════════════════════════════════════
+# LIVE API — реальные данные с Bybit через executor
+# ═══════════════════════════════════════════════════════
+
+def _bybit_signed_get(path, params=""):
+    """Signed GET к Bybit (для private endpoints)."""
+    import hashlib, hmac, urllib.request
+    api_file = os.path.expanduser("~/.bybit_api")
+    if not os.path.exists(api_file):
+        api_file = "/root/.bybit_api"
+    if not os.path.exists(api_file):
+        return {"retCode": -1, "retMsg": "no api keys"}
+    key, secret = open(api_file).read().strip().split("\n")
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    q = f"{ts}{key}{recv}{params}"
+    sign = hmac.new(secret.encode(), q.encode(), hashlib.sha256).hexdigest()
+    url = f"https://api.bybit.com{path}?{params}"
+    req = urllib.request.Request(url, headers={
+        "X-BAPI-SIGN-TYPE": "SHA256", "X-BAPI-SIGN": sign,
+        "X-BAPI-API-KEY": key, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv,
+    })
+    return json.loads(urllib.request.urlopen(req, timeout=10).read())
+
+
+async def api_live_overview(req):
+    """Обзор LIVE — реальные баланс/позиции с биржи."""
+    try:
+        d = _bybit_signed_get("/v5/account/wallet-balance", "accountType=UNIFIED&coin=USDT")
+        if d.get("retCode") != 0:
+            return web.json_response({"error": d.get("retMsg", "?")})
+        acct = d["result"]["list"][0]
+        equity = float(acct.get("totalEquity", 0))
+        balance = float(acct.get("totalWalletBalance", 0))
+        coin = acct.get("coin", [{}])
+        usdt = coin[0] if coin else {}
+        try:
+            available = float(usdt.get("availableToWithdraw", 0) or 0)
+        except (ValueError, TypeError):
+            available = 0.0
+
+        # Позиции
+        dp = _bybit_signed_get("/v5/position/list", "category=linear&settleCoin=USDT")
+        positions = []
+        if dp.get("retCode") == 0:
+            for p in dp["result"]["list"]:
+                if float(p["size"]) > 0:
+                    positions.append({
+                        "symbol": p["symbol"],
+                        "size": float(p["size"]),
+                        "side": p["side"],
+                        "avgPrice": float(p.get("avgPrice", 0)),
+                        "leverage": p.get("leverage", ""),
+                        "takeProfit": p.get("takeProfit", ""),
+                        "stopLoss": p.get("stopLoss", ""),
+                        "trailingStop": p.get("trailingStop", ""),
+                        "unrealisedPnl": float(p.get("unrealisedPnl", 0)),
+                    })
+
+        # Закрытые сделки (для WR/PnL)
+        dc = _bybit_signed_get("/v5/position/closed-pnl", "category=linear&limit=100")
+        closed = []
+        if dc.get("retCode") == 0:
+            for t in dc["result"]["list"]:
+                closed.append({
+                    "symbol": t["symbol"], "pnl": float(t["closedPnl"]),
+                    "qty": float(t["qty"]), "ts": int(t.get("createdTime", 0)),
+                })
+        total_pnl = sum(c["pnl"] for c in closed)
+        wins = sum(1 for c in closed if c["pnl"] > 0)
+        wr = wins / len(closed) * 100 if closed else 0
+
+        # Ордера (DCA лимитки)
+        dor = _bybit_signed_get("/v5/order/realtime", "category=linear&settleCoin=USDT")
+        open_orders = len(dor["result"]["list"]) if dor.get("retCode") == 0 else 0
+
+        return web.json_response({
+            "mode": "LIVE",
+            "balance": round(balance, 4),
+            "equity": round(equity, 4),
+            "available": round(available, 4),
+            "total_pnl": round(total_pnl, 4),
+            "open_count": len(positions),
+            "open_orders": open_orders,
+            "closed_count": len(closed),
+            "win_rate": round(wr, 1),
+            "positions": positions,
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)})
+
+
+async def api_live_open(req):
+    """Открытые позиции LIVE — детально с биржи."""
+    try:
+        dp = _bybit_signed_get("/v5/position/list", "category=linear&settleCoin=USDT")
+        positions = []
+        if dp.get("retCode") == 0:
+            for p in dp["result"]["list"]:
+                if float(p["size"]) > 0:
+                    # Подгрузим ордера по символу для DCA
+                    dor = _bybit_signed_get("/v5/order/realtime", f"category=linear&symbol={p['symbol']}")
+                    dca_orders = []
+                    if dor.get("retCode") == 0:
+                        for o in dor["result"]["list"]:
+                            dca_orders.append({
+                                "orderId": o["orderId"][:12],
+                                "side": o["side"],
+                                "price": float(o.get("price", 0)),
+                                "qty": float(o.get("qty", 0)),
+                                "type": o.get("orderType", ""),
+                                "status": o.get("orderStatus", ""),
+                            })
+                    positions.append({
+                        "symbol": p["symbol"],
+                        "size": float(p["size"]),
+                        "side": p["side"],
+                        "avgPrice": float(p.get("avgPrice", 0)),
+                        "leverage": p.get("leverage", ""),
+                        "takeProfit": p.get("takeProfit", ""),
+                        "stopLoss": p.get("stopLoss", ""),
+                        "trailingStop": p.get("trailingStop", ""),
+                        "activePrice": p.get("activePrice", ""),
+                        "unrealisedPnl": float(p.get("unrealisedPnl", 0)),
+                        "dca_orders": dca_orders,
+                    })
+        return web.json_response({"positions": positions})
+    except Exception as e:
+        return web.json_response({"error": str(e)})
+
+
+async def api_live_trades(req):
+    """История закрытых сделок LIVE — с биржи (closed-pnl)."""
+    try:
+        dc = _bybit_signed_get("/v5/position/closed-pnl", "category=linear&limit=100")
+        trades = []
+        if dc.get("retCode") == 0:
+            for t in dc["result"]["list"]:
+                entry_ts = int(t.get("createdTime", 0))  # время закрытия
+                exit_ts = int(t.get("updatedTime", t.get("createdTime", 0)))
+                # Bybit closed-pnl: createdTime = время закрытия, keyed для entry нет
+                # берём avgEntryPrice / avgExitPrice
+                trades.append({
+                    "symbol": t["symbol"],
+                    "side": t.get("side", ""),
+                    "qty": float(t["qty"]),
+                    "pnl": float(t["closedPnl"]),
+                    "entry": float(t.get("avgEntryPrice", 0)),
+                    "exit": float(t.get("avgExitPrice", 0)),
+                    "ts": entry_ts,
+                    "exitTs": exit_ts,
+                    "date": datetime.fromtimestamp(entry_ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                    "leverage": t.get("leverage", ""),
+                })
+        trades.sort(key=lambda x: x["ts"], reverse=True)
+        return web.json_response({"trades": trades})
+    except Exception as e:
+        return web.json_response({"error": str(e)})
+
+
+async def api_live_chart(req):
+    """График LIVE — свечи с Bybit + реальные уровни позиции + маркеры сделки."""
+    sym = req.query.get("symbol", "")
+    interval = req.query.get("interval", "15")  # 1, 5, 15, 60, 240, D
+    limit = int(req.query.get("limit", 300))
+    # Для конкретной сделки: от и до (ms)
+    from_ts = req.query.get("from", "")
+    to_ts = req.query.get("to", "")
+    if not sym:
+        return web.json_response({"error": "no symbol"})
+    try:
+        # Свечи (public, без auth)
+        params = f"category=linear&symbol={sym}&interval={interval}&limit={limit}"
+        if from_ts and to_ts:
+            params += f"&start={from_ts}&end={to_ts}"
+        url = f"{BYBIT}/v5/market/kline?{params}"
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                data = await resp.json()
+        candles = []
+        for k in data.get("result", {}).get("list", []):
+            candles.append({
+                "t": int(k[0]) / 1000, "o": float(k[1]), "h": float(k[2]),
+                "l": float(k[3]), "c": float(k[4]), "v": float(k[5]),
+            })
+        candles.sort(key=lambda x: x["t"])
+
+        # Реальная позиция (для уровней SL/TP/entry)
+        dp = _bybit_signed_get("/v5/position/list", f"category=linear&symbol={sym}")
+        pos_info = None
+        if dp.get("retCode") == 0:
+            for p in dp["result"]["list"]:
+                if float(p["size"]) > 0:
+                    pos_info = {
+                        "side": p["side"], "size": float(p["size"]),
+                        "avgPrice": float(p.get("avgPrice", 0)),
+                        "takeProfit": p.get("takeProfit", ""),
+                        "stopLoss": p.get("stopLoss", ""),
+                        "trailingStop": p.get("trailingStop", ""),
+                        "activePrice": p.get("activePrice", ""),
+                    }
+                    break
+
+        # DCA ордера
+        dor = _bybit_signed_get("/v5/order/realtime", f"category=linear&symbol={sym}")
+        dca_levels = []
+        if dor.get("retCode") == 0:
+            for o in dor["result"]["list"]:
+                if o.get("orderType") == "Limit":
+                    dca_levels.append(float(o.get("price", 0)))
+
+        # Маркеры сделки (из query: entry, exit, entryTs, exitTs, pnl)
+        trade_markers = None
+        entry_price = req.query.get("entry", "")
+        exit_price = req.query.get("exit", "")
+        entry_ts = req.query.get("entryTs", "")
+        exit_ts_q = req.query.get("exitTs", "")
+        pnl_val = req.query.get("pnl", "")
+        if entry_price or exit_price:
+            trade_markers = {
+                "entry": float(entry_price) if entry_price else None,
+                "exit": float(exit_price) if exit_price else None,
+                "entryTs": int(entry_ts) / 1000 if entry_ts else None,
+                "exitTs": int(exit_ts_q) / 1000 if exit_ts_q else None,
+                "pnl": float(pnl_val) if pnl_val else None,
+            }
+
+        return web.json_response({
+            "symbol": sym,
+            "candles": candles,
+            "position": pos_info,
+            "dca_levels": dca_levels,
+            "trade_markers": trade_markers,
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)})
+
+
 # ── HTML ──
 
 HTML = """<!doctype html>
@@ -458,7 +696,10 @@ tr:hover { background: #1e2329; cursor: pointer; }
 @media (max-width: 600px) { .stat .val { font-size: 16px; } #tv-chart { height: 380px; } #chart-box { height: 380px; } .eq-chart { height: 240px; } }
 </style></head><body><div class="container">
 <header>
-  <h1>Short Bot #2 <small id="upd"></small></h1>
+  <h1>Short Bot #2 <small id="upd"></small> <span style="font-size:11px;color:#848e9c">DEMO</span></h1>
+  <div style="display:flex;gap:6px">
+    <a href="/live" style="padding:6px 14px;background:#f6465d;color:#fff;border-radius:6px;font-size:13px;text-decoration:none;font-weight:600">→ LIVE</a>
+  </div>
   <div class="tabs">
     <div class="tab active" data-view="overview">Обзор</div>
     <div class="tab" data-view="open">Открытые</div>
@@ -1155,6 +1396,8 @@ setInterval(() => { if (!$('#view-overview').classList.contains('hidden')) loadO
 
 
 async def index(req):
+    """Корень — редирект на Live (демо отключено, данные устарели)."""
+    return web.HTTPFound("/live")
     return web.Response(text=HTML, content_type="text/html")
 
 
@@ -1172,8 +1415,421 @@ async def charts_page(request):
         return web.Response(text="charts.html not found", status=404)
     return web.FileResponse(chart_path, headers={"Content-Type": "text/html; charset=utf-8"})
 
+# ── Auth по токену в query string (чтобы fetch работал) ──
+import hashlib, base64
+DASH_TOKEN = os.environ.get("DASH_TOKEN", "piktor2026")
+
+@web.middleware
+async def auth_middleware(req, handler):
+    # Токен в query: ?token=...
+    token = req.query.get("token", "")
+    if token == DASH_TOKEN:
+        return await handler(req)
+    # Или Basic auth (fallback)
+    auth = req.headers.get("Authorization", "")
+    if auth.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(auth[6:]).decode()
+            user, _, pw = decoded.partition(":")
+            if user == "piktor" and pw == "RdnxScalp2026!":
+                return await handler(req)
+        except Exception:
+            pass
+    return web.Response(
+        status=401,
+        headers={"WWW-Authenticate": 'Basic realm="Short Bot"'},
+        text="Authorization required. Use ?token=piktor2026",
+    )
+
+
+async def live_page(request):
+    """Live dashboard — реальные данные с Bybit."""
+    html = LIVE_HTML
+    return web.Response(text=html, headers={"Content-Type": "text/html; charset=utf-8"})
+
+
+LIVE_HTML = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Short Bot — LIVE</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #0b0e11; color: #eaecef; font: 14px/1.4 -apple-system,Segoe UI,Roboto,sans-serif; }
+.container { max-width: 1200px; margin: 0 auto; padding: 12px; }
+header { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #1e2329; margin-bottom: 12px; flex-wrap: wrap; gap: 8px; }
+header h1 { font-size: 18px; color: #f0b90b; }
+header h1 small { color: #848e9c; font-weight: normal; font-size: 12px; }
+.nav { display: flex; gap: 8px; }
+.nav a { color: #4a9eff; text-decoration: none; padding: 6px 14px; background: #1e2329; border-radius: 6px; font-size: 13px; }
+.nav a.active { background: #f0b90b; color: #0b0e11; font-weight: 600; }
+.tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 12px; }
+.tab { padding: 6px 14px; background: #1e2329; border-radius: 6px; cursor: pointer; color: #848e9c; font-size: 13px; }
+.tab.active { background: #f0b90b; color: #0b0e11; font-weight: 600; }
+.card { background: #181a20; border: 1px solid #1e2329; border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+.stat { display: flex; flex-direction: column; }
+.stat .lbl { color: #848e9c; font-size: 11px; text-transform: uppercase; }
+.stat .val { font-size: 20px; font-weight: 600; }
+.stat .val.pos { color: #0ecb81; }
+.stat .val.neg { color: #f6465d; }
+.live-badge { display: inline-block; padding: 2px 8px; background: #f6465d; color: #fff; border-radius: 4px; font-size: 11px; font-weight: 600; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid #1e2329; }
+th { color: #848e9c; font-size: 11px; text-transform: uppercase; }
+.pos { color: #0ecb81; } .neg { color: #f6465d; }
+.sym-input { padding: 6px; background: #1e2329; border: 1px solid #2b3139; border-radius: 4px; color: #eaecef; font-size: 13px; }
+.btn { padding: 6px 14px; background: #f0b90b; color: #0b0e11; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; }
+.btn:hover { background: #d4a517; }
+#chart { width: 100%; height: 450px; }
+.muted { color: #848e9c; }
+select, input { background: #1e2329; border: 1px solid #2b3139; color: #eaecef; padding: 6px; border-radius: 4px; }
+.dca-row { color: #4a9eff; font-size: 12px; }
+</style></head><body><div class="container">
+  <header>
+    <h1>Short Bot <small>LIVE <span class="live-badge">REAL</span></small></h1>
+    <div class="nav">
+      <a href="/live" class="active">Live</a>
+    </div>
+  </header>
+
+  <div class="tabs">
+    <div class="tab active" data-view="overview">Обзор</div>
+    <div class="tab" data-view="open">Открытые</div>
+    <div class="tab" data-view="trades">История</div>
+    <div class="tab" data-view="chart">График</div>
+  </div>
+
+  <div id="view-overview" class="view">
+    <div class="card">
+      <div class="grid">
+        <div class="stat"><span class="lbl">Баланс</span><span class="val" id="s-balance">—</span></div>
+        <div class="stat"><span class="lbl">Equity</span><span class="val" id="s-equity">—</span></div>
+        <div class="stat"><span class="lbl">Доступно</span><span class="val" id="s-avail">—</span></div>
+        <div class="stat"><span class="lbl">PnL всего</span><span class="val" id="s-pnl">—</span></div>
+        <div class="stat"><span class="lbl">Win Rate</span><span class="val" id="s-wr">—</span></div>
+        <div class="stat"><span class="lbl">Открыто</span><span class="val" id="s-open">—</span></div>
+        <div class="stat"><span class="lbl">Ордера (DCA)</span><span class="val" id="s-orders">—</span></div>
+        <div class="stat"><span class="lbl">Закрыто</span><span class="val" id="s-closed">—</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="lbl muted" style="margin-bottom:8px">ОТКРЫТЫЕ ПОЗИЦИИ (с биржи)</div>
+      <div id="open-list"></div>
+    </div>
+  </div>
+
+  <div id="view-open" class="view" style="display:none">
+    <div class="card">
+      <div class="lbl muted" style="margin-bottom:8px">ОТКРЫТЫЕ ПОЗИЦИИ + DCA ОРДЕРА</div>
+      <div id="open-detail"></div>
+    </div>
+  </div>
+
+  <div id="view-trades" class="view" style="display:none">
+    <div class="card">
+      <div class="lbl muted" style="margin-bottom:8px">ИСТОРИЯ СДЕЛОК (с биржи)</div>
+      <table id="trades-table"><thead><tr>
+        <th>Дата</th><th>Символ</th><th>Сторона</th><th>Qty</th>
+        <th>Вход</th><th>Выход</th><th>PnL</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+
+  <div id="view-chart" class="view" style="display:none">
+    <div class="card">
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+        <input class="sym-input" id="chart-sym" placeholder="Символ (EPICUSDT)" value="EPICUSDT">
+        <select id="chart-interval">
+          <option value="1">1m</option>
+          <option value="5">5m</option>
+          <option value="15" selected>15m</option>
+          <option value="60">1h</option>
+          <option value="240">4h</option>
+          <option value="D">1D</option>
+        </select>
+        <button class="btn" onclick="loadChart()">Построить</button>
+        <span class="muted" id="chart-info"></span>
+      </div>
+      <div id="chart"></div>
+      <div id="chart-levels" style="margin-top:10px"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// Токен из URL для авторизации API
+const TOKEN = new URLSearchParams(location.search).get('token') || 'piktor2026';
+const API = `/api/live`;
+
+// Переключение вкладок
+document.querySelectorAll('.tab').forEach(t => {
+  t.onclick = () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    document.querySelectorAll('.view').forEach(v => v.style.display = 'none');
+    document.getElementById('view-' + t.dataset.view).style.display = 'block';
+    if (t.dataset.view === 'open') loadOpen();
+    if (t.dataset.view === 'trades') loadTrades();
+  };
+});
+
+function fmt(n, d=2) { return n != null ? Number(n).toFixed(d) : '—'; }
+function pnlClass(n) { return n > 0 ? 'pos' : n < 0 ? 'neg' : ''; }
+
+async function loadOverview() {
+  try {
+    const r = await fetch(`${API}/overview?token=${TOKEN}`, {credentials: 'include'});
+    const d = await r.json();
+    if (d.error) { document.getElementById('s-balance').textContent = 'ERROR: ' + d.error; return; }
+    document.getElementById('s-balance').textContent = '$' + fmt(d.balance);
+    document.getElementById('s-equity').textContent = '$' + fmt(d.equity);
+    document.getElementById('s-avail').textContent = '$' + fmt(d.available);
+    const pnlEl = document.getElementById('s-pnl');
+    pnlEl.textContent = '$' + fmt(d.total_pnl);
+    pnlEl.className = 'val ' + pnlClass(d.total_pnl);
+    document.getElementById('s-wr').textContent = d.win_rate + '%';
+    document.getElementById('s-open').textContent = d.open_count;
+    document.getElementById('s-orders').textContent = d.open_orders;
+    document.getElementById('s-closed').textContent = d.closed_count;
+
+    // Список позиций
+    let html = '';
+    if (!d.positions || d.positions.length === 0) {
+      html = '<p class="muted">Открытых позиций нет</p>';
+    } else {
+      html = '<table><thead><tr><th>Символ</th><th>Сторона</th><th>Qty</th><th>Entry</th><th>SL</th><th>TP</th><th>PnL</th></tr></thead><tbody>';
+      for (const p of d.positions) {
+        const pnlCls = p.unrealisedPnl > 0 ? 'pos' : 'neg';
+        html += `<tr><td><b>${p.symbol}</b></td><td>${p.side}</td><td>${p.size}</td>
+          <td>${fmt(p.avgPrice, 6)}</td><td>${p.stopLoss || '—'}</td><td>${p.takeProfit || '—'}</td>
+          <td class="${pnlCls}">${fmt(p.unrealisedPnl)}</td></tr>`;
+      }
+      html += '</tbody></table>';
+    }
+    document.getElementById('open-list').innerHTML = html;
+  } catch(e) { document.getElementById('s-balance').textContent = 'ERR: ' + e; }
+}
+
+async function loadOpen() {
+  try {
+    const r = await fetch(`${API}/open?token=${TOKEN}`, {credentials: 'include'});
+    const d = await r.json();
+    if (d.error) { document.getElementById('open-detail').innerHTML = 'ERROR: ' + d.error; return; }
+    let html = '';
+    if (!d.positions || d.positions.length === 0) {
+      html = '<p class="muted">Открытых позиций нет</p>';
+    } else {
+      for (const p of d.positions) {
+        const pnlCls = p.unrealisedPnl > 0 ? 'pos' : 'neg';
+        html += `<div style="margin-bottom:16px;padding:10px;background:#1e2329;border-radius:6px">
+          <div style="display:flex;gap:12px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+            <b style="font-size:16px">${p.symbol}</b>
+            <span class="muted">${p.side} ${p.size} @ ${fmt(p.avgPrice,6)}</span>
+            <span>Lev: ${p.leverage}x</span>
+            <span class="${p.pnlCls}">PnL: ${fmt(p.unrealisedPnl)}</span>
+          </div>
+          <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(100px,1fr));margin-bottom:8px">
+            <div class="stat"><span class="lbl">SL</span><span>${p.stopLoss || '—'}</span></div>
+            <div class="stat"><span class="lbl">TP</span><span>${p.takeProfit || '—'}</span></div>
+            <div class="stat"><span class="lbl">Trail</span><span>${p.trailingStop || '—'}</span></div>
+            <div class="stat"><span class="lbl">Active</span><span>${p.activePrice || '—'}</span></div>
+          </div>`;
+        if (p.dca_orders && p.dca_orders.length > 0) {
+          html += '<div class="muted" style="font-size:11px;margin-bottom:4px">DCA ОРДЕРА:</div><table><thead><tr><th>Цена</th><th>Сторона</th><th>Qty</th><th>Тип</th><th>Статус</th></tr></thead><tbody>';
+          for (const o of p.dca_orders) {
+            html += `<tr class="dca-row"><td>${fmt(o.price, 6)}</td><td>${o.side}</td><td>${o.qty}</td><td>${o.type}</td><td>${o.status}</td></tr>`;
+          }
+          html += '</tbody></table>';
+        } else {
+          html += '<p class="muted" style="font-size:12px">DCA ордеров нет</p>';
+        }
+        html += '</div>';
+      }
+    }
+    document.getElementById('open-detail').innerHTML = html;
+  } catch(e) { document.getElementById('open-detail').innerHTML = 'ERR: ' + e; }
+}
+
+async function loadTrades() {
+  try {
+    const r = await fetch(`${API}/trades?token=${TOKEN}`, {credentials: 'include'});
+    const d = await r.json();
+    if (d.error) { document.querySelector('#trades-table tbody').innerHTML = '<tr><td colspan=7>ERROR: ' + d.error + '</td></tr>'; return; }
+    let html = '';
+    if (!d.trades || d.trades.length === 0) {
+      html = '<tr><td colspan=7 class="muted">Закрытых сделок нет</td></tr>';
+    } else {
+      for (const t of d.trades) {
+        const cls = t.pnl > 0 ? 'pos' : 'neg';
+        // Клик на строку → открыть график сделки
+        const onclick = `showTradeChart('${t.symbol}', ${t.entry}, ${t.exit}, ${t.ts}, ${t.exitTs}, ${t.pnl})`;
+        html += `<tr style="cursor:pointer" onclick="${onclick}" title="Клик — показать на графике">
+          <td>${t.date}</td><td><b>${t.symbol}</b></td><td>${t.side}</td>
+          <td>${t.qty}</td><td>${fmt(t.entry,6)}</td><td>${fmt(t.exit,6)}</td>
+          <td class="${cls}">${fmt(t.pnl)}</td></tr>`;
+      }
+    }
+    document.querySelector('#trades-table tbody').innerHTML = html;
+  } catch(e) { document.querySelector('#trades-table tbody').innerHTML = '<tr><td colspan=7>ERR: ' + e + '</td></tr>'; }
+}
+
+// Показать график конкретной сделки
+function showTradeChart(sym, entry, exit, entryTs, exitTs, pnl) {
+  // Переключить на вкладку График
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+  document.querySelector('.tab[data-view="chart"]').classList.add('active');
+  document.querySelectorAll('.view').forEach(v => v.style.display = 'none');
+  document.getElementById('view-chart').style.display = 'block';
+  document.getElementById('chart-sym').value = sym;
+  // Загрузить график с маркерами сделки
+  loadTradeChart(sym, entry, exit, entryTs, exitTs, pnl);
+}
+
+async function loadTradeChart(sym, entry, exit, entryTs, exitTs, pnl) {
+  const interval = document.getElementById('chart-interval').value;
+  document.getElementById('chart-info').textContent = 'Загрузка сделки ' + sym + '...';
+  try {
+    // Окно вокруг сделки: -1 день до entry, +1 день после exit (или +7 дней если exit 0)
+    const fromMs = entryTs - 86400000;  // -1 день
+    const toMs = (exitTs || entryTs) + 86400000 * 3;  // +3 дня
+    const r = await fetch(`${API}/chart?symbol=${sym}&interval=${interval}&from=${fromMs}&to=${toMs}&entry=${entry}&exit=${exit}&entryTs=${entryTs}&exitTs=${exitTs||0}&pnl=${pnl}&token=${TOKEN}`, {credentials: 'include'});
+    const d = await r.json();
+    if (d.error) { document.getElementById('chart-info').textContent = 'ERROR: ' + d.error; return; }
+
+    if (!chart) {
+      chart = LightweightCharts.createChart(document.getElementById('chart'), {
+        layout: { background: { color: '#0b0e11' }, textColor: '#848e9c' },
+        grid: { vertLines: { color: '#1e2329' }, horzLines: { color: '#1e2329' } },
+        timeScale: { timeVisible: true, secondsVisible: false },
+      });
+      candleSeries = chart.addCandlestickSeries({
+        upColor: '#0ecb81', downColor: '#f6465d',
+        borderUpColor: '#0ecb81', borderDownColor: '#f6465d',
+        wickUpColor: '#0ecb81', wickDownColor: '#f6465d',
+      });
+    }
+    const candles = d.candles.map(c => ({
+      time: c.t, open: c.o, high: c.h, low: c.l, close: c.c,
+    }));
+    candleSeries.setData(candles);
+
+    let levelsHtml = '';
+    // Маркеры сделки
+    if (d.trade_markers) {
+      const tm = d.trade_markers;
+      if (tm.entry) {
+        candleSeries.createPriceLine({ price: tm.entry, color: '#4a9eff', lineWidth: 2, lineStyle: 0, title: 'Entry' });
+        levelsHtml += `<div>🔵 Entry: ${fmt(tm.entry,6)}</div>`;
+      }
+      if (tm.exit) {
+        const exitColor = tm.pnl >= 0 ? '#0ecb81' : '#f6465d';
+        candleSeries.createPriceLine({ price: tm.exit, color: exitColor, lineWidth: 2, lineStyle: 0, title: 'Exit' });
+        const cls = tm.pnl >= 0 ? 'pos' : 'neg';
+        levelsHtml += `<div class="${cls}">🔴 Exit: ${fmt(tm.exit,6)} (PnL: ${fmt(tm.pnl)})</div>`;
+      }
+      // Маркеры на свечах entry/exit
+      const markers = [];
+      if (tm.entryTs) {
+        markers.push({time: tm.entryTs, position: 'belowBar', color: '#4a9eff', shape: 'arrowUp', text: 'Entry'});
+      }
+      if (tm.exitTs) {
+        const mColor = tm.pnl >= 0 ? '#0ecb81' : '#f6465d';
+        markers.push({time: tm.exitTs, position: 'aboveBar', color: mColor, shape: 'arrowDown', text: 'Exit'});
+      }
+      if (markers.length > 0) {
+        markers.sort((a,b) => a.time - b.time);
+        candleSeries.setMarkers(markers);
+      }
+    }
+    // Текущая позиция (если есть)
+    if (d.position) {
+      const p = d.position;
+      candleSeries.createPriceLine({ price: p.avgPrice, color: '#4a9eff', lineWidth: 1, lineStyle: 0, title: 'Current Entry' });
+      if (p.stopLoss) candleSeries.createPriceLine({ price: parseFloat(p.stopLoss), color: '#f6465d', lineWidth: 1, lineStyle: 2, title: 'SL' });
+      if (p.takeProfit) candleSeries.createPriceLine({ price: parseFloat(p.takeProfit), color: '#0ecb81', lineWidth: 1, lineStyle: 2, title: 'TP' });
+    }
+    // DCA уровни
+    if (d.dca_levels && d.dca_levels.length > 0) {
+      levelsHtml += '<div style="margin-top:6px"><b class="pos">DCA лимитки:</b> ' + d.dca_levels.map(l => fmt(l,6)).join(', ') + '</div>';
+    }
+    document.getElementById('chart-levels').innerHTML = levelsHtml;
+    document.getElementById('chart-info').textContent = `Сделка ${sym} — ${candles.length} свечей`;
+    chart.timeScale().fitContent();
+  } catch(e) { document.getElementById('chart-info').textContent = 'ERR: ' + e; }
+}
+
+// График
+let chart = null, candleSeries = null;
+async function loadChart() {
+  const sym = document.getElementById('chart-sym').value.toUpperCase();
+  const interval = document.getElementById('chart-interval').value;
+  if (!sym) return;
+  document.getElementById('chart-info').textContent = 'Загрузка...';
+  try {
+    const r = await fetch(`${API}/chart?symbol=${sym}&interval=${interval}&limit=300&token=${TOKEN}`, {credentials: 'include'});
+    const d = await r.json();
+    if (d.error) { document.getElementById('chart-info').textContent = 'ERROR: ' + d.error; return; }
+    
+    if (!chart) {
+      chart = LightweightCharts.createChart(document.getElementById('chart'), {
+        layout: { background: { color: '#0b0e11' }, textColor: '#848e9c' },
+        grid: { vertLines: { color: '#1e2329' }, horzLines: { color: '#1e2329' } },
+        timeScale: { timeVisible: true, secondsVisible: false },
+      });
+      candleSeries = chart.addCandlestickSeries({
+        upColor: '#0ecb81', downColor: '#f6465d',
+        borderUpColor: '#0ecb81', borderDownColor: '#f6465d',
+        wickUpColor: '#0ecb81', wickDownColor: '#f6465d',
+      });
+    }
+    const candles = d.candles.map(c => ({
+      time: c.t, open: c.o, high: c.h, low: c.l, close: c.c,
+    }));
+    candleSeries.setData(candles);
+    
+    // Уровни позиции
+    let levelsHtml = '';
+    if (d.position) {
+      const p = d.position;
+      // Entry
+      candleSeries.createPriceLine({ price: p.avgPrice, color: '#4a9eff', lineWidth: 1, lineStyle: 0, title: 'Entry ' + p.side });
+      levelsHtml += `<div>Entry: ${fmt(p.avgPrice,6)} (${p.side} ${p.size})</div>`;
+      if (p.stopLoss) {
+        candleSeries.createPriceLine({ price: parseFloat(p.stopLoss), color: '#f6465d', lineWidth: 1, lineStyle: 2, title: 'SL' });
+        levelsHtml += `<div class="neg">SL: ${p.stopLoss}</div>`;
+      }
+      if (p.takeProfit) {
+        candleSeries.createPriceLine({ price: parseFloat(p.takeProfit), color: '#0ecb81', lineWidth: 1, lineStyle: 2, title: 'TP' });
+        levelsHtml += `<div class="pos">TP: ${p.takeProfit}</div>`;
+      }
+      if (p.activePrice) {
+        candleSeries.createPriceLine({ price: parseFloat(p.activePrice), color: '#f0b90b', lineWidth: 1, lineStyle: 1, title: 'Trail active' });
+        levelsHtml += `<div>Trail active: ${p.activePrice}</div>`;
+      }
+    } else {
+      levelsHtml = '<span class="muted">Нет открытой позиции по этому символу</span>';
+    }
+    // DCA уровни
+    if (d.dca_levels && d.dca_levels.length > 0) {
+      levelsHtml += '<div style="margin-top:6px"><b class="pos">DCA лимитки:</b> ' + d.dca_levels.map(l => fmt(l,6)).join(', ') + '</div>';
+    }
+    document.getElementById('chart-levels').innerHTML = levelsHtml;
+    document.getElementById('chart-info').textContent = `${sym} ${interval}m — ${candles.length} свечей`;
+    chart.timeScale().fitContent();
+  } catch(e) { document.getElementById('chart-info').textContent = 'ERR: ' + e; }
+}
+
+// Автообновление
+loadOverview();
+setInterval(loadOverview, 5000);
+</script>
+</body></html>
+"""
+
+
 async def main():
-    app = web.Application()
+    app = web.Application(middlewares=[auth_middleware])
     app.router.add_get("/", index)
     app.router.add_get("/charts", charts_page)
     app.router.add_get("/tv", tv_page)
@@ -1181,6 +1837,12 @@ async def main():
     app.router.add_get("/api/open", api_open)
     app.router.add_get("/api/trades", api_trades)
     app.router.add_get("/api/chart", api_chart)
+    # LIVE API
+    app.router.add_get("/api/live/overview", api_live_overview)
+    app.router.add_get("/api/live/open", api_live_open)
+    app.router.add_get("/api/live/trades", api_live_trades)
+    app.router.add_get("/api/live/chart", api_live_chart)
+    app.router.add_get("/live", live_page)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8077)

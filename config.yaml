@@ -5,26 +5,33 @@
 
 # ── Торговля ──
 direction: short              # short | long
-mode: paper                   # paper (симуляция на реальных ценах)
+mode: live                    # paper | live  (live = реальные ордера через executor)
 
-# ── Риск (настраиваемо) ──
-risk_pct: 5.0                 # % депозита на сделку (увеличен с 2% → 5%)
-initial_balance: 1000.0       # стартовый депозит (USDT)
-max_open_positions: 5         # одновременно открытых позиций (увеличено с 3 → 5)
-max_daily_entries: 20         # лимит входов в день
+# ── Риск (под депозит $143) ──
+risk_pct: 3.0                 # % депозита на сделку (теряем при стопе)
+initial_balance: 143.0        # стартовый депозит (для логов/дашборда)
+max_open_positions: 3         # 3 позиции, изолированная маржа — ликвидация одной не трогает другие
+max_daily_entries: 15         # лимит входов в день
 
-# ── Стратегия: SL/TP/Trail/Act (% от цены входа) ──
-# Найдено grid search: макс Sharpe конфиг
-sl_pct: 30.0                  # финальный SL после DCA (от avg entry)
-tp_pct: 5.0                   # тейк-профит (быстрый выход при падении 5%)
-trail_pct: 3.0                 # трейлинг отступ от минимума
-activation_pct: 1.0           # активация trail при падении на 1%
+# ── Плечо и маржа ──
+leverage: 3                   # плечо (3x → ликвидация при -33%, SL -25% успевает)
+margin_mode: isolated         # isolated | cross (isolated = риск только позиции)
+
+# ── Стратегия: SL/TP/Trail/DCA ──
+sl_pct: 25.0                  # финальный SL от avg после всех DCA (НЕ двигается до DCA×5)
+tp_chain: [20.0, 20.0, 20.0, 20.0, 20.0, 20.0]  # TP % на каждом DCA уровне (от avg)
+trail_pct: 3.0                # трейлинг % (на DCA×4-5)
+trail_at_dca: 4               # DCA уровень с которого включается trail
+trail_active_pct: 5.0         # активация trail при падении на 5% ниже avg (в плюсе)
+activation_pct: 1.0           # (legacy, не используется в live)
+be_plus_at_dca: 4             # DCA уровень с которого TP = avg (выход в плюс)
+
 # ── DCA усреднение ──
-dca_enabled: true             # включить усреднение при росте против шорта
-dca_max_count: 2              # макс количество усреднений (×2 = позиция до 3x)
-dca_trigger_pct: 10.0         # рост на N% → усреднение (докупаем шорт)
-dca_qty_multiplier: 1.0       # каждый DCA докупает ×N от изначального qty
-min_sl_hold_seconds: 30       # мин. удержание SL (anti-noise)
+dca_enabled: true
+dca_max_count: 5              # 5 усреднений → позиция 6x
+dca_trigger_pct: 15.0         # рост на 15% от avg → усреднение
+dca_qty_multiplier: 1.0       # каждый DCA докупает ×1 от оригинального qty
+min_sl_hold_seconds: 30       # (legacy, биржа держит SL)
 
 # ── Комиссии и проскальзывание ──
 commission_taker_pct: 0.055   # Bybit taker RT (0.055% round-trip)
