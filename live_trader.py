@@ -45,19 +45,24 @@ def init(cfg):
     TRAIL_ACTIVE_PCT = cfg.get("trail_active_pct", 5.0)
 
 
-def calc_dca_levels(entry, qty_orig):
-    """Все DCA уровни от entry. Возвращает list of dict."""
+def calc_dca_levels(entry, qty_orig, start_level=1, current_qty=None):
+    """DCA уровни от entry. start_level — номер первого уровня (по умолчанию 1).
+    current_qty — текущий размер позиции (для расчёта avg после DCA).
+    Возвращает list of dict с level, trigger_price, fill_price, avg_after, qty_after."""
     levels = []
     avg = entry
-    qty = qty_orig
+    qty = current_qty if current_qty else qty_orig
     for i in range(DCA_MAX):
+        level = start_level + i
+        if level > DCA_MAX:
+            break
         trigger = avg * (1 + DCA_TRIG / 100)
         fill = trigger
         new_qty = qty_orig * DCA_MULT
         avg_new = (avg * qty + fill * new_qty) / (qty + new_qty)
         qty_new = qty + new_qty
         levels.append({
-            "level": i + 1,
+            "level": level,
             "trigger_price": trigger,
             "fill_price": fill,
             "avg_after": avg_new,
@@ -209,6 +214,64 @@ def _set_tp_order(symbol, qty, trigger_price, order_link_id=""):
         log.error(f"[TP order] {d.get('retMsg')} code={d.get('retCode')}")
         return None
     return d["result"].get("orderId")
+
+
+def reconcile_dca_limits(pos):
+    """Разовая сверка DCA-лимиток с биржей. Вызывать ТОЛЬКО при load/restore.
+    Ставит недостающие, отменяет устаревшие. НЕ трогает SL/TP.
+    Идемпотентна — повторный вызов не дублирует."""
+    sym = pos["symbol"]
+    avg = pos.get("entry_price") or pos.get("original_entry") or 0.0
+    orig_qty = pos.get("original_qty") or pos.get("qty") or 0.0
+    dca_count = pos.get("dca_count", 0)
+    if avg <= 0 or orig_qty <= 0:
+        return
+    current_qty = pos.get("qty") or orig_qty
+    try:
+        levels = calc_dca_levels(avg, orig_qty,
+                                  start_level=dca_count + 1, current_qty=current_qty)
+    except Exception:
+        return
+    # целевые цены для уровней > dca_count (ещё не исполненные)
+    target = {}
+    for lvl in levels:
+        if lvl["level"] > dca_count:
+            target[lvl["level"]] = lvl["fill_price"]
+    target_prices = set(target.values())
+    try:
+        orders = get_open_orders(sym)
+    except Exception as e:
+        log.error(f"[{sym}] reconcile: get_open_orders error: {e}")
+        return
+    existing = {}  # price -> orderId (только Limit)
+    for o in orders:
+        if o.get("orderType") == "Limit":
+            p = float(o.get("price", 0))
+            if p > 0:
+                existing[p] = o["orderId"]
+    # 1. Отменяем устаревшие Limit-ордера не совпадающие с target
+    for p, oid in existing.items():
+        matches = any(abs(p - tp) < avg * 0.001 for tp in target_prices)
+        if not matches:
+            try:
+                cancel_order(sym, oid)
+                log.info(f"[{sym}] reconcile: устаревший DCA-лимит отменён ${p:.6f}")
+            except Exception as e:
+                log.error(f"[{sym}] reconcile: cancel error: {e}")
+    # 2. Ставим недостающие (по уровням > dca_count)
+    dca_ids = pos.get("dca_order_ids") or {}
+    for lvl_num, tp in target.items():
+        already = any(abs(p - tp) < avg * 0.001 for p in existing)
+        if not already:
+            dca_qty = orig_qty * DCA_MULT
+            try:
+                oid = place_dca_limit(sym, dca_qty, tp)
+                if oid:
+                    dca_ids[str(lvl_num)] = oid
+                    log.info(f"[{sym}] reconcile: DCAx{lvl_num} поставлен ${tp:.6f}")
+            except Exception as e:
+                log.error(f"[{sym}] reconcile: place DCAx{lvl_num} error: {e}")
+    pos["dca_order_ids"] = dca_ids
 
 
 def restore_positions_from_exchange(existing_symbols):
@@ -401,20 +464,20 @@ def sync_position(pos):
         pos["final_sl_set"] = True
         log.info(f"[{sym}] финальный SL уточнён ${real_sl:.6f} qty={current_qty}")
 
-    # Переставить оставшиеся DCA лимитки (если нужно)
-    remaining = calc_dca_levels(current_avg, original_qty)
+    # Переставить оставшиеся DCA лимитки (уровни > real_dca_count, от текущего avg)
+    remaining = calc_dca_levels(current_avg, original_qty,
+                                start_level=real_dca_count + 1, current_qty=current_qty)
     existing_prices = {float(o.get("price", 0)) for o in get_open_orders(sym)
                        if o.get("orderType") == "Limit" and float(o.get("price", 0)) > 0}
     for lvl in remaining:
-        if lvl["level"] > real_dca_count:
-            # Проверить — стоит ли уже лимитка близко
-            close = any(abs(p - lvl["fill_price"]) < current_avg * 0.001 for p in existing_prices)
-            if not close:
-                dca_qty = original_qty * DCA_MULT
-                oid = place_dca_limit(sym, dca_qty, lvl["fill_price"])
-                if oid:
-                    pos["dca_order_ids"][lvl["level"]] = oid
-                    log.info(f"[{sym}] DCA×{lvl['level']} переставлена ${lvl['fill_price']:.6f}")
+        # Проверить — стоит ли уже лимитка близко
+        close = any(abs(p - lvl["fill_price"]) < current_avg * 0.001 for p in existing_prices)
+        if not close:
+            dca_qty = original_qty * DCA_MULT
+            oid = place_dca_limit(sym, dca_qty, lvl["fill_price"])
+        if oid:
+            pos["dca_order_ids"][lvl["level"]] = oid
+            log.info("[%s] DCAx%s переставлена $%.6f" % (sym, lvl["level"], lvl["fill_price"]))
 
     return "open"
 

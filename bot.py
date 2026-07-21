@@ -333,12 +333,43 @@ def dca_average(pos, dca_price, ts):
              f"new_SL={pos['sl_price']:.6f} new_TP={pos['tp_price']:.6f}")
 
 
+
+def _ensure_pos_fields(pos):
+    """Инициализация полей live-позиций, отсутствующих в positions.json
+    (min_price, activated, act_price, dca_trigger_price, dca_count, dca_max_count).
+    Фикс WS-ошибок KeyError после рестарта с live-позициями."""
+    entry = pos.get("entry_price") or pos.get("original_entry") or 0.0
+    if pos.get("min_price") is None:
+        pos["min_price"] = entry
+    if pos.get("activated") is None:
+        pos["activated"] = False
+    if pos.get("act_price") is None:
+        pos["act_price"] = entry * (1 - CFG.get("activation_pct", 5.0)/100) if entry else 0.0
+    if pos.get("dca_trigger_price") is None:
+        pos["dca_trigger_price"] = entry * (1 + CFG.get("dca_trigger_pct", 10.0)/100) if entry else 0.0
+    if pos.get("dca_count") is None:
+        pos["dca_count"] = 0
+    if pos.get("dca_max_count") is None:
+        pos["dca_max_count"] = CFG.get("dca_max_count", 0)
+    if pos.get("trail_pct") is None:
+        pos["trail_pct"] = CFG.get("trail_pct", 3.0)
+    if pos.get("sl_price") is None:
+        pos["sl_price"] = entry * (1 + CFG.get("sl_pct", 25.0)/100) if entry else 0.0
+    if pos.get("tp_price") is None:
+        pos["tp_price"] = entry * (1 - CFG.get("tp_pct", 20.0)/100) if entry else 0.0
+    return pos
+
 def process_position(pos, high, low, price, ts):
     """Проверить DCA/SL/TP/Trail по цене."""
+    _ensure_pos_fields(pos)
     # anti-noise gate
     if ts - pos["entry_ts"] < CFG["min_sl_hold_seconds"]:
         return
-    # update min_price
+    # update min_price (инициализация для live-позиций без поля)
+    if pos.get("min_price") is None:
+        pos["min_price"] = pos["entry_price"]
+    if pos.get("activated") is None:
+        pos["activated"] = False
     if low < pos["min_price"]:
         pos["min_price"] = low
     # ── DCA: усреднение при росте на dca_trigger_pct% ──
@@ -434,6 +465,35 @@ def check_signal(ts):
 
 
 # ── Bybit: получить список символов ──
+
+async def init_day_open(symbols):
+    """Инициализация day_open через REST — дневная свеча (interval=D),
+    open = цена 00:00 UTC. Фикс бага: первая WS-свеча после рестарта
+    давала day_open от момента старта, а не от 00:00 UTC → ломала ранжирование."""
+    import asyncio as _aio
+    STATE.day_open.clear()
+    base = CFG["bybit_rest_url"]
+    sem = _aio.Semaphore(20)
+    async def fetch_one(sym):
+        u = base + "/v5/market/kline?category=linear&symbol=" + sym + "&interval=D&limit=1"
+        try:
+            async with sem:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(u, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        d = await resp.json()
+            if d.get("retCode") == 0 and d["result"]["list"]:
+                op = float(d["result"]["list"][0][1])
+                if op > 0:
+                    STATE.day_open[sym] = op
+                    return 1
+        except Exception:
+            pass
+        return 0
+    results = await _aio.gather(*[fetch_one(s) for s in symbols], return_exceptions=True)
+    loaded = sum(1 for r in results if r == 1)
+    log.info("init_day_open: загружено " + str(loaded) + "/" + str(len(symbols)) + " day_open через REST (interval=D)")
+    return loaded
+
 async def fetch_symbols():
     """USDT linear perp, статус Trading, исключить heavy."""
     url = f"{CFG['bybit_rest_url']}/v5/market/instruments-info?category=linear"
@@ -686,6 +746,13 @@ def load_positions():
             STATE.balance = bal
     # traded_today — монеты по которым уже входили (чтобы не входить повторно)
     STATE.traded_today = {p["symbol"] for p in open_pos}
+    # ГАРАНТИЯ: разовая сверка DCA-лимиток при загрузке (идемпотентно, без спама)
+    if LIVE_MODE:
+        for p in STATE.open_positions:
+            try:
+                live_trader.reconcile_dca_limits(p)
+            except Exception as _e:
+                log.error(f"reconcile error {p.get('symbol')}: {_e}")
     log.info(f"load_positions: восстановлено {len(open_pos)} позиций, balance=${STATE.balance:.2f}, "
              f"traded_today={STATE.traded_today}")
 
@@ -715,7 +782,8 @@ async def main():
     load_positions()  # восстановить позиции и баланс после рестарта
     symbols = await fetch_symbols()
     STATE.symbols = symbols
-    # для каждого символа ставим day_open из первого тикера
+    # day_open через REST (фикс бага: раньше первая WS-свеча = день-открытие)
+    await init_day_open(symbols)
     tasks = [
         asyncio.create_task(ws_handler(symbols)),
         asyncio.create_task(periodic_save()),
