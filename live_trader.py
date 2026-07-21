@@ -19,9 +19,10 @@ log = logging.getLogger("live_trader")
 SL_PCT = 25.0
 TP_CHAIN = [20.0] * 6
 DCA_MAX = 5
-DCA_TRIG = 15.0
+DCA_TRIG_SCHEME = [15.0] * 5   # % роста от avg для каждого DCA уровня (1..5)
 DCA_MULT = 1.0
 RISK_PCT = 3.0
+RISK_NOTIONAL_PCT = 20.0       # notional = balance × % / 100 (когда SL выключен, sl_pct-расчёт не работает)
 LEVERAGE = 3
 BE_PLUS_AT_DCA = 4
 TRAIL_PCT = 3.0
@@ -30,14 +31,23 @@ TRAIL_ACTIVE_PCT = 5.0
 
 
 def init(cfg):
-    global SL_PCT, TP_CHAIN, DCA_MAX, DCA_TRIG, DCA_MULT, RISK_PCT
+    global SL_PCT, TP_CHAIN, DCA_MAX, DCA_TRIG_SCHEME, DCA_MULT, RISK_PCT, RISK_NOTIONAL_PCT
     global LEVERAGE, BE_PLUS_AT_DCA, TRAIL_PCT, TRAIL_AT_DCA, TRAIL_ACTIVE_PCT
     SL_PCT = cfg.get("sl_pct", 25.0)
     TP_CHAIN = cfg.get("tp_chain", [20.0] * 6)
     DCA_MAX = cfg.get("dca_max_count", 5)
-    DCA_TRIG = cfg.get("dca_trigger_pct", 15.0)
+    # dca_trigger_pct может быть массивом (схема 10/15/20/25/30) или числом (15×5)
+    dt = cfg.get("dca_trigger_pct", 15.0)
+    if isinstance(dt, list):
+        DCA_TRIG_SCHEME = list(dt)
+        # дополнить до DCA_MAX последним значением если короче
+        while len(DCA_TRIG_SCHEME) < DCA_MAX:
+            DCA_TRIG_SCHEME.append(DCA_TRIG_SCHEME[-1])
+    else:
+        DCA_TRIG_SCHEME = [float(dt)] * DCA_MAX
     DCA_MULT = cfg.get("dca_qty_multiplier", 1.0)
     RISK_PCT = cfg.get("risk_pct", 3.0)
+    RISK_NOTIONAL_PCT = cfg.get("risk_notional_pct", 20.0)
     LEVERAGE = cfg.get("leverage", 3)
     BE_PLUS_AT_DCA = cfg.get("be_plus_at_dca", 4)
     TRAIL_PCT = cfg.get("trail_pct", 3.0)
@@ -56,7 +66,9 @@ def calc_dca_levels(entry, qty_orig, start_level=1, current_qty=None):
         level = start_level + i
         if level > DCA_MAX:
             break
-        trigger = avg * (1 + DCA_TRIG / 100)
+        # % триггера берётся из схемы по номеру уровня (level 1..DCA_MAX)
+        trig_pct = DCA_TRIG_SCHEME[min(level - 1, len(DCA_TRIG_SCHEME) - 1)]
+        trigger = avg * (1 + trig_pct / 100)
         fill = trigger
         new_qty = qty_orig * DCA_MULT
         avg_new = (avg * qty + fill * new_qty) / (qty + new_qty)
@@ -105,8 +117,14 @@ def open_live_position(symbol, entry_price, balance, ts):
         log.error(f"[{symbol}] нет instrument info")
         return None
 
-    risk_usd = balance * RISK_PCT / 100
-    qty = risk_usd / (entry_price * SL_PCT / 100)
+    # qty расчёт: без SL (sl_pct=0) используем явный notional от % depо.
+    # Со SL: старая формула risk_usd/(entry×sl_pct) — риск при стопе = risk_pct depо.
+    if SL_PCT > 0:
+        risk_usd = balance * RISK_PCT / 100
+        qty = risk_usd / (entry_price * SL_PCT / 100)
+    else:
+        notional_target = balance * RISK_NOTIONAL_PCT / 100
+        qty = notional_target / entry_price
     qty = round(qty / inst["qtyStep"]) * inst["qtyStep"]
     notional = qty * entry_price
     if notional < inst["minNotional"]:
@@ -137,13 +155,17 @@ def open_live_position(symbol, entry_price, balance, ts):
     final_sl = calc_final_sl(fill_price, actual_qty)
     tp = calc_tp(0, fill_price)
 
-    # SL/TP conditional на РЕАЛЬНЫЙ size (actual_qty)
-    # После каждого DCA бот переставит на новый размер
-    sl_oid = set_stop_loss_order(symbol, actual_qty, final_sl, order_link_id=f"SL-{symbol}-{int(ts)}")
-    if sl_oid:
-        log.info(f"[{symbol}] SL conditional ${final_sl:.6f} qty={actual_qty} orderId={sl_oid[:12]}...")
+    # SL conditional — ТОЛЬКО если SL_PCT > 0. При sl_pct=0 позиция без SL,
+    # защита = TP + trail (на DCA×4-5) + ручной контроль юзера.
+    sl_oid = None
+    if SL_PCT > 0:
+        sl_oid = set_stop_loss_order(symbol, actual_qty, final_sl, order_link_id=f"SL-{symbol}-{int(ts)}")
+        if sl_oid:
+            log.info(f"[{symbol}] SL conditional ${final_sl:.6f} qty={actual_qty} orderId={sl_oid[:12]}...")
+        else:
+            log.error(f"[{symbol}] SL не поставился! Позиция без защиты!")
     else:
-        log.error(f"[{symbol}] SL не поставился! Позиция без защиты!")
+        log.info(f"[{symbol}] SL отключён (sl_pct=0) — позиция без SL, защита TP+trail+ручной контроль")
 
     tp_oid = _set_tp_order(symbol, actual_qty, tp, order_link_id=f"TP-{symbol}-{int(ts)}")
     if tp_oid:
@@ -227,11 +249,18 @@ def reconcile_dca_limits(pos):
     if avg <= 0 or orig_qty <= 0:
         return
     current_qty = pos.get("qty") or orig_qty
-    try:
-        levels = calc_dca_levels(avg, orig_qty,
-                                  start_level=dca_count + 1, current_qty=current_qty)
-    except Exception:
-        return
+    # ВАЖНО: если позиция уже имеет dca_levels в state (открыта по старой схеме),
+    # используем СОХРАНЁННЫЕ уровни — не пересчитываем по новой схеме.
+    # Иначе при смене DCA-схемы reconcile отменит все лимитки и сломает live-позицию.
+    saved_levels = pos.get("dca_levels") or []
+    if saved_levels:
+        levels = saved_levels
+    else:
+        try:
+            levels = calc_dca_levels(avg, orig_qty,
+                                      start_level=dca_count + 1, current_qty=current_qty)
+        except Exception:
+            return
     # целевые цены для уровней > dca_count (ещё не исполненные)
     target = {}
     for lvl in levels:
@@ -424,7 +453,8 @@ def sync_position(pos):
     new_tp = calc_tp(real_dca_count, current_avg)
     if pos.get("tp_order_id"):
         cancel_order(sym, pos["tp_order_id"])
-    if pos.get("sl_order_id"):
+    # SL отменяем только если он вообще есть (sl_pct>0)
+    if SL_PCT > 0 and pos.get("sl_order_id"):
         cancel_order(sym, pos["sl_order_id"])
     # На DCA×4-5 — trail вместо TP
     if real_dca_count >= TRAIL_AT_DCA and TRAIL_PCT > 0:
@@ -440,20 +470,21 @@ def sync_position(pos):
         pos["tp_order_id"] = tp_oid
         log.info(f"[{sym}] TP поднят ${new_tp:.6f} qty={current_qty}")
 
-    # Переставить SL на новый размер (та же цена, новый qty)
+    # Переставить SL на новый размер (та же цена, новый qty) — ТОЛЬКО если SL включён
     # SL цена = финальный, не меняется до DCA×5
-    sl_price = pos["sl_price"]
-    if real_dca_count < DCA_MAX:
-        new_sl_oid = set_stop_loss_order(sym, current_qty, sl_price,
-                                          order_link_id=f"SL-{sym}-{int(time.time())}")
-        pos["sl_order_id"] = new_sl_oid
-        log.info(f"[{sym}] SL переставлен ${sl_price:.6f} qty={current_qty}")
+    if SL_PCT > 0:
+        sl_price = pos["sl_price"]
+        if real_dca_count < DCA_MAX:
+            new_sl_oid = set_stop_loss_order(sym, current_qty, sl_price,
+                                              order_link_id=f"SL-{sym}-{int(time.time())}")
+            pos["sl_order_id"] = new_sl_oid
+            log.info(f"[{sym}] SL переставлен ${sl_price:.6f} qty={current_qty}")
 
     # SL НЕ ТРОГАЕМ — conditional order стоит, не двигаем
     pos["tp_price"] = new_tp
 
-    # После DCA×5 — уточнить SL (отменить старый, поставить новый на РЕАЛЬНЫЙ size)
-    if real_dca_count >= DCA_MAX and not pos.get("final_sl_set"):
+    # После DCA×5 — уточнить SL (отменить старый, поставить новый на РЕАЛЬНЫЙ size) — ТОЛЬКО если SL включён
+    if SL_PCT > 0 and real_dca_count >= DCA_MAX and not pos.get("final_sl_set"):
         real_sl = current_avg * (1 + SL_PCT / 100)
         if pos.get("sl_order_id"):
             cancel_order(sym, pos["sl_order_id"])
@@ -464,9 +495,15 @@ def sync_position(pos):
         pos["final_sl_set"] = True
         log.info(f"[{sym}] финальный SL уточнён ${real_sl:.6f} qty={current_qty}")
 
-    # Переставить оставшиеся DCA лимитки (уровни > real_dca_count, от текущего avg)
-    remaining = calc_dca_levels(current_avg, original_qty,
-                                start_level=real_dca_count + 1, current_qty=current_qty)
+    # Переставить оставшиеся DCA лимитки (уровни > real_dca_count).
+    # ВАЖНО: если позиция открыта по старой схеме (есть dca_levels в state),
+    # берём уровни оттуда — не пересчитываем по новой схеме.
+    saved_levels = pos.get("dca_levels") or []
+    if saved_levels:
+        remaining = [l for l in saved_levels if l["level"] > real_dca_count]
+    else:
+        remaining = calc_dca_levels(current_avg, original_qty,
+                                    start_level=real_dca_count + 1, current_qty=current_qty)
     existing_prices = {float(o.get("price", 0)) for o in get_open_orders(sym)
                        if o.get("orderType") == "Limit" and float(o.get("price", 0)) > 0}
     for lvl in remaining:

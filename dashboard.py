@@ -313,8 +313,8 @@ async def api_chart(req):
         tp_pct = float(cfg.get("tp_pct", 15))
         trail_pct = float(cfg.get("trail_pct", 10))
         act_pct = float(cfg.get("activation_pct", 1))
-        # шорт: SL выше входа, TP ниже
-        trade["sl_price"] = e * (1 + sl_pct / 100)
+        # шорт: SL выше входа, TP ниже (SL=0 → без стопа)
+        trade["sl_price"] = e * (1 + sl_pct / 100) if sl_pct > 0 else None
         trade["tp_price"] = e * (1 - tp_pct / 100)
         trade["act_price"] = e * (1 - act_pct / 100)
         trade["trail_pct"] = trail_pct
@@ -821,7 +821,8 @@ async function loadOverview() {
 function renderStrategy(c) {
   const dcaOn = c.dca_enabled !== false;
   const dcaMax = c.dca_max_count || 0;
-  const dcaTrig = c.dca_trigger_pct || 0;
+  const dcaTrigRaw = c.dca_trigger_pct || 0;
+  const dcaTrig = Array.isArray(dcaTrigRaw) ? dcaTrigRaw.join('/') : dcaTrigRaw;
   const dcaMult = c.dca_qty_multiplier || 1;
   const maxQty = (1 + dcaMax * dcaMult).toFixed(0);
   const html = `
@@ -840,7 +841,7 @@ function renderStrategy(c) {
     <div style="margin-bottom:10px">
       <b style="color:#f0b90b">Выход:</b><br>
       • <b>TP</b> ${c.tp_pct||5}% — фиксация при падении на 5%<br>
-      • <b>SL</b> ${c.sl_pct||30}% — стоп при росте на 30% (широкий, на откат)<br>
+      • <b>SL</b> ${c.sl_pct>0 ? (c.sl_pct+'% — стоп при росте') : '<span style="color:#f6465d">ОТКЛЮЧЕН</span> — ручной контроль'}<br>
       • <b>Trail</b> ${c.trail_pct||3}% отступ, активация при падении ${c.activation_pct||1}%
     </div>
     <div style="margin-bottom:10px">
@@ -859,12 +860,16 @@ function renderStrategy(c) {
     </div>
     <div>
       <b style="color:#f0b90b">Риск-менеджмент:</b><br>
-      • Заявленный risk: ${c.risk_pct||5}% на сделку = $${(c.risk_pct||5)*(c.initial_balance||1000)/100}<br>
-      • Notional позиции: $${((c.risk_pct||5)*(c.initial_balance||1000)/100/((c.sl_pct||30)/100)).toFixed(0)}
-      → после DCA×${dcaMax}: $${((c.risk_pct||5)*(c.initial_balance||1000)/100/((c.sl_pct||30)/100)*(1+dcaMax*dcaMult)).toFixed(0)}<br>
-      • <b style="color:#f6465d">Убыток на SL после DCA: ~$${((c.risk_pct||5)*(c.initial_balance||1000)/100*(1+dcaMax*dcaMult)).toFixed(0)}
-      = ~${((c.risk_pct||5)*(1+dcaMax*dcaMult)).toFixed(0)}% депозита</b><br>
-      • Два SL подряд = ~${((c.risk_pct||5)*(1+dcaMax*dcaMult)*2).toFixed(0)}% депозита
+      • Заявленный risk: ${c.risk_pct||5}% на сделку = $${((c.risk_pct||5)*(c.initial_balance||1000)/100).toFixed(2)}<br>
+      ${c.sl_pct > 0
+        ? `• Notional позиции: $${((c.risk_pct||5)*(c.initial_balance||1000)/100/((c.sl_pct||30)/100)).toFixed(0)}<br>
+         → после DCA×${dcaMax}: $${((c.risk_pct||5)*(c.initial_balance||1000)/100/((c.sl_pct||30)/100)*(1+dcaMax*dcaMult)).toFixed(0)}<br>
+        • <b style="color:#f6465d">Убыток на SL после DCA: ~$${((c.risk_pct||5)*(c.initial_balance||1000)/100*(1+dcaMax*dcaMult)).toFixed(0)}
+        = ~${((c.risk_pct||5)*(1+dcaMax*dcaMult)).toFixed(0)}% депозита</b><br>
+        • Два SL подряд = ~${((c.risk_pct||5)*(1+dcaMax*dcaMult)*2).toFixed(0)}% депозита`
+        : `• <b>SL отключён</b> — notional = ${c.risk_notional_pct||20}% depо = $${((c.risk_notional_pct||20)*(c.initial_balance||1000)/100).toFixed(0)}<br>
+        → после DCA×${dcaMax}: $${((c.risk_notional_pct||20)*(c.initial_balance||1000)/100*(1+dcaMax*dcaMult)).toFixed(0)}<br>
+        • <b style="color:#f6465d">Без SL: риск не ограничен, контроль — TP + trail + ручные закрытия</b>`}
     </div>`;
   const el = $('#strategy-desc');
   if (el) el.innerHTML = html;

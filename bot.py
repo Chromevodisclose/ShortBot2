@@ -26,7 +26,9 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("short_bot")
-dca_info = f" DCA={CFG.get('dca_enabled',False)}×{CFG.get('dca_max_count',0)} trig={CFG.get('dca_trigger_pct',0)}%"
+_dca_trig_cfg = CFG.get('dca_trigger_pct', 0)
+_dca_trig_str = '/'.join(str(x) for x in _dca_trig_cfg) if isinstance(_dca_trig_cfg, list) else str(_dca_trig_cfg)
+dca_info = f" DCA={CFG.get('dca_enabled',False)}×{CFG.get('dca_max_count',0)} trig={_dca_trig_str}%"
 
 # ── Live trader (реальные ордера) ──
 LIVE_MODE = CFG.get("mode", "paper") == "live"
@@ -37,7 +39,7 @@ if LIVE_MODE:
 mode_info = "LIVE (реальные ордера)" if LIVE_MODE else "PAPER (симуляция)"
 log.info(f"=== Short Bot #2 старт | {mode_info} | risk={CFG['risk_pct']}% SL={CFG['sl_pct']}% "
          f"TP_chain={CFG.get('tp_chain',[CFG.get('tp_pct',5)])} DCA×{CFG.get('dca_max_count',0)} "
-         f"trig={CFG.get('dca_trigger_pct',0)}% Lev={CFG.get('leverage',1)}x{dca_info} ===")
+         f"trig={_dca_trig_str}% Lev={CFG.get('leverage',1)}x{dca_info} ===")
 
 
 def utc_now():
@@ -95,7 +97,12 @@ def calc_position_size(entry_price, sl_pct, risk_pct, balance, leverage=1):
     qty = risk / (entry * sl_pct/100) / leverage
     """
     risk_usd = balance * risk_pct / 100.0
-    qty = risk_usd / (entry_price * sl_pct / 100.0)
+    if sl_pct > 0:
+        qty = risk_usd / (entry_price * sl_pct / 100.0)
+    else:
+        # SL выключен — размер по notional % depо (как в live_trader)
+        notional_target = balance * CFG.get("risk_notional_pct", 20.0) / 100.0
+        qty = notional_target / entry_price
     return qty
 
 
@@ -134,14 +141,14 @@ def open_short(symbol, entry_price, qty, ts):
         # ── DCA поля ──
         "dca_count": 0,                          # сколько усреднений сделано
         "original_qty": qty,                      # изначальный qty (для DCA докупки)
-        "dca_trigger_price": fill * (1 + CFG.get("dca_trigger_pct", 10.0)/100),  # цена DCA триггера
+        "dca_trigger_price": fill * (1 + (_dca_trig_cfg[0] if isinstance(_dca_trig_cfg, list) else _dca_trig_cfg)/100),  # цена DCA триггера (1-й уровень)
         "dca_max_count": CFG.get("dca_max_count", 0),  # макс усреднений
         "dca_qty_mult": CFG.get("dca_qty_multiplier", 1.0),  # множитель докупки
         "original_entry": fill,                   # изначальный entry (для отчёта)
     }
     STATE.balance -= commission  # комиссия списывается
     STATE.open_positions.append(pos)
-    dca_trig = f" DCA_trig={pos['dca_trigger_price']:.6f}({CFG.get('dca_trigger_pct',0)}%)" if CFG.get("dca_enabled") else ""
+    dca_trig = f" DCA_trig={pos['dca_trigger_price']:.6f}({_dca_trig_str}%)" if CFG.get("dca_enabled") else ""
     log.info(f"OPEN SHORT {symbol} qty={qty:.6f} entry={fill:.6f} notional={notional:.2f} comm={commission:.4f} SL={pos['sl_price']:.6f} TP={pos['tp_price']:.6f}{dca_trig}")
     return pos
 
@@ -321,7 +328,14 @@ def dca_average(pos, dca_price, ts):
     pos["sl_price"] = avg_entry * (1 + CFG["sl_pct"]/100)
     pos["tp_price"] = avg_entry * (1 - CFG["tp_pct"]/100)
     pos["act_price"] = avg_entry * (1 - CFG["activation_pct"]/100)
-    pos["dca_trigger_price"] = avg_entry * (1 + CFG.get("dca_trigger_pct", 10.0)/100)
+    # dca_trigger_price: % берётся из схемы по следующему DCA уровню
+    dt = CFG.get("dca_trigger_pct", 10.0)
+    next_level = pos["dca_count"] + 1
+    if isinstance(dt, list):
+        trig_pct = dt[min(next_level - 1, len(dt) - 1)]
+    else:
+        trig_pct = dt
+    pos["dca_trigger_price"] = avg_entry * (1 + trig_pct/100)
 
     # Сбрасываем активацию — trail пересчитается от нового avg
     pos["activated"] = False
@@ -346,7 +360,10 @@ def _ensure_pos_fields(pos):
     if pos.get("act_price") is None:
         pos["act_price"] = entry * (1 - CFG.get("activation_pct", 5.0)/100) if entry else 0.0
     if pos.get("dca_trigger_price") is None:
-        pos["dca_trigger_price"] = entry * (1 + CFG.get("dca_trigger_pct", 10.0)/100) if entry else 0.0
+        # % первого DCA-уровня из схемы (или число если не массив)
+        dt = CFG.get("dca_trigger_pct", 10.0)
+        trig_pct = dt[0] if isinstance(dt, list) else dt
+        pos["dca_trigger_price"] = entry * (1 + trig_pct/100) if entry else 0.0
     if pos.get("dca_count") is None:
         pos["dca_count"] = 0
     if pos.get("dca_max_count") is None:
@@ -566,36 +583,40 @@ async def ws_handler(symbols):
                     if not LIVE_MODE:
                         for pos in list(STATE.open_positions):
                             apply_funding(pos, ts)
-                    # LIVE: синхронизация с биржей (каждые 15с)
+                    # LIVE: синхронизация с биржей (throttle 15с, НЕ на каждый тик!)
+                    # Раньше sync на каждом сообщении → REST-перегрузка event loop.
+                    # Маскировалось падением process_position на dca_qty_mult (реконнект).
                     if LIVE_MODE and STATE.open_positions:
-                        for pos in list(STATE.open_positions):
-                            if not pos.get("live"):
-                                continue
-                            status = live_trader.sync_position(pos)
-                            if status == "closed":
-                                # позиция закрылась на бирже (TP/SL/trail)
-                                # обновим баланс с биржи
-                                STATE.balance = live_trader.get_balance() or STATE.balance
-                                # запись сделки
-                                sym = pos["symbol"]
-                                # упрощённо — pnl из баланса
-                                # (точный pnl можно взять из /v5/position/closed-pnl)
-                                trade = {
-                                    "id": pos["id"], "symbol": sym, "side": "short",
-                                    "entry_price": pos["entry_price"],
-                                    "exit_price": live_trader.get_ticker(sym),
-                                    "qty": pos["qty"],
-                                    "reason": "closed_on_exchange",
-                                    "entry_ts": pos["entry_ts"], "exit_ts": ts,
-                                    "dca_count": pos["dca_count"],
-                                    "balance_after": STATE.balance,
-                                    "date": day_key(datetime.fromtimestamp(ts, tz=timezone.utc)),
-                                    "live": True,
-                                }
-                                write_trade(trade)
-                                STATE.open_positions.remove(pos)
-                                save_positions()
-                                log.info(f"LIVE закрыта {sym} dca×{pos['dca_count']} balance=${STATE.balance:.2f}")
+                        if ts - getattr(STATE, "_last_sync_ts", 0) >= 15:
+                            STATE._last_sync_ts = ts
+                            for pos in list(STATE.open_positions):
+                                if not pos.get("live"):
+                                    continue
+                                status = live_trader.sync_position(pos)
+                                if status == "closed":
+                                    # позиция закрылась на бирже (TP/SL/trail)
+                                    # обновим баланс с биржи
+                                    STATE.balance = live_trader.get_balance() or STATE.balance
+                                    # запись сделки
+                                    sym = pos["symbol"]
+                                    # упрощённо — pnl из баланса
+                                    # (точный pnl можно взять из /v5/position/closed-pnl)
+                                    trade = {
+                                        "id": pos["id"], "symbol": sym, "side": "short",
+                                        "entry_price": pos["entry_price"],
+                                        "exit_price": live_trader.get_ticker(sym),
+                                        "qty": pos["qty"],
+                                        "reason": "closed_on_exchange",
+                                        "entry_ts": pos["entry_ts"], "exit_ts": ts,
+                                        "dca_count": pos["dca_count"],
+                                        "balance_after": STATE.balance,
+                                        "date": day_key(datetime.fromtimestamp(ts, tz=timezone.utc)),
+                                        "live": True,
+                                    }
+                                    write_trade(trade)
+                                    STATE.open_positions.remove(pos)
+                                    save_positions()
+                                    log.info(f"LIVE закрыта {sym} dca×{pos['dca_count']} balance=${STATE.balance:.2f}")
                     # проверка сигнала по интервалу
                     if ts - STATE.last_rank_ts >= CFG["ranking_interval_min"] * 60:
                         check_signal(ts)
