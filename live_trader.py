@@ -11,7 +11,7 @@ from executor import (
     set_stop_loss_order, cancel_stop_loss_order, get_stop_loss_orders,
     cancel_order, cancel_all, close_market,
     get_position, get_open_orders, get_balance, get_ticker,
-    get_instrument, set_leverage,
+    get_instrument, set_leverage, get_available_margin,
 )
 
 log = logging.getLogger("live_trader")
@@ -104,9 +104,10 @@ def calc_tp(dca_count, avg):
 def open_live_position(symbol, entry_price, balance, ts):
     """
     Открыть лайв позицию:
+      0. Pre-flight: хватает ли маржи под позицию + все DCA×5?
       1. Плечо
       2. Market short
-      3. SL conditional order (не position-level!)
+      3. SL conditional order (если sl_pct>0)
       4. TP conditional order
       5. DCA лимитки (проверка дублей)
     """
@@ -133,6 +134,23 @@ def open_live_position(symbol, entry_price, balance, ts):
     if qty < inst["minQty"]:
         log.error(f"[{symbol}] qty {qty} < minQty {inst['minQty']}")
         return None
+
+    # ── Pre-flight: хватит ли маржи под позицию + все DCA лимитки? ──
+    # Позиция 6x (вход + 5 DCA), each DCA = orig_qty × mult по цене выше avg.
+    # Маржа = total notional / leverage. Берём conservatively последний DCA ×5 цену.
+    dca_levels = calc_dca_levels(entry_price, qty)
+    total_notional = qty * entry_price  # вход
+    for lvl in dca_levels:
+        total_notional += qty * DCA_MULT * lvl["fill_price"]  # каждый DCA
+    margin_needed = total_notional / LEVERAGE
+    # доступная маржа = walletBalance − positionIM − orderIM (уже занято)
+    avail = get_available_margin()
+    if avail is not None and margin_needed > avail:
+        log.warning(f"[{symbol}] НЕ ХВАТАЕТ МАРЖИ: нужно ${margin_needed:.2f} (поз+DCA×5), "
+                    f"свободно ${avail:.2f} — вход отменён")
+        return None
+    log.info(f"[{symbol}] маржа OK: нужно ${margin_needed:.2f}, свободно ${avail:.2f}" if avail else
+             f"[{symbol}] маржа check skipped (avail=None)")
 
     log.info(f"[{symbol}] открытие: qty={qty} entry~${entry_price:.6f} notional=${notional:.2f}")
 

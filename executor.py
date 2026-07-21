@@ -96,6 +96,23 @@ def get_balance() -> Optional[float]:
     return 0.0
 
 
+def get_available_margin() -> Optional[float]:
+    """Свободная маржа = walletBalance − totalPositionIM − totalOrderIM.
+    Bybit резервирует маржу под открытые позиции и лимитные ордера заранее."""
+    d = _get("/v5/account/wallet-balance", "accountType=UNIFIED&coin=USDT")
+    if d.get("retCode") != 0:
+        print(f"[get_available_margin] {d.get('retMsg')}")
+        return None
+    coins = d["result"]["list"][0].get("coin", [])
+    if coins:
+        c = coins[0]
+        wallet = float(c.get("walletBalance", 0))
+        pos_im = float(c.get("totalPositionIM", 0))
+        order_im = float(c.get("totalOrderIM", 0))
+        return wallet - pos_im - order_im
+    return 0.0
+
+
 def get_position(symbol: str) -> Optional[dict]:
     """Реальная позиция по символу. Возвращает {size, side, avgPrice, takeProfit, stopLoss} или None."""
     d = _get("/v5/position/list", f"category=linear&symbol={symbol}")
