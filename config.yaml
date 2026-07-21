@@ -38,7 +38,8 @@ dca_max_count: 5              # 5 усреднений → позиция 6x
 dca_trigger_pct: [10.0, 15.0, 20.0, 25.0, 30.0]  # % роста от avg для каждого DCA уровня (1..5)
 dca_qty_multiplier: 1.0       # каждый DCA докупает ×1 от оригинального qty
 # qty позиции: без SL риск-расчёт через sl_pct ломается — используем явный % depо на notional.
-risk_notional_pct: 20.0       # notional позиции = balance × risk_notional_pct / 100 (≈ $37 при $185 depо, 3x lev)
+risk_notional_pct: 10.0       # notional позиции = balance × 10% / 100 (≈ $18.5 при $185, 3x lev).
+                              # Без SL риск не ограничен → позиция меньше. 3 поз × DCA×5 = $111 маржа (запас в $185).
 min_sl_hold_seconds: 30       # (legacy, биржа держит SL)
 
 # ── Комиссии и проскальзывание ──
