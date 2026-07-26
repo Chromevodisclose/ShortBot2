@@ -374,10 +374,25 @@ def _ensure_pos_fields(pos):
         pos["sl_price"] = entry * (1 + CFG.get("sl_pct", 25.0)/100) if entry else 0.0
     if pos.get("tp_price") is None:
         pos["tp_price"] = entry * (1 - CFG.get("tp_pct", 20.0)/100) if entry else 0.0
+    # Поля, отсутствующие в restored live-позициях (fix KeyError funding_paid/dca_qty_mult)
+    if "funding_paid" not in pos:
+        pos["funding_paid"] = 0.0
+    if "commission_paid" not in pos:
+        pos["commission_paid"] = 0.0
+    if "dca_qty_mult" not in pos:
+        pos["dca_qty_mult"] = CFG.get("dca_qty_multiplier", 1.0)
+    if "last_funding_ts" not in pos:
+        pos["last_funding_ts"] = pos.get("entry_ts", 0)
+    if "entry_next_funding_ms" not in pos:
+        pos["entry_next_funding_ms"] = 0
+    if "funding_rate_at_open" not in pos:
+        pos["funding_rate_at_open"] = 0.0
     return pos
 
 def process_position(pos, high, low, price, ts):
-    """Проверить DCA/SL/TP/Trail по цене."""
+    """Проверить DCA/SL/TP/Trail по цене (PAPER). LIVE управляются sync_position."""
+    if pos.get("live"):
+        return  # LIVE: DCA/SL/TP/Trail на бирже через sync_position
     _ensure_pos_fields(pos)
     # anti-noise gate
     if ts - pos["entry_ts"] < CFG["min_sl_hold_seconds"]:

@@ -23,7 +23,7 @@ margin_mode: isolated         # isolated | cross (isolated = риск тольк
 # 9 из 12 SL-срабатываний были иглами (цена вернулась ниже avg) — SL снимал прибыль на пике.
 sl_pct: 0.0                  # 0 = SL conditional order НЕ ставится. Защита = TP + trail + ручной контроль.
 tp_chain: [20.0, 20.0, 20.0, 20.0, 20.0, 20.0]  # TP % на каждом DCA уровне (от avg)
-trail_pct: 3.0                # трейлинг % (на DCA×4-5)
+trail_pct: 0.0                # трейлинг OFF (backtest 180d: trail вредит net/avg, режет TP)
 trail_at_dca: 4               # DCA уровень с которого включается trail
 trail_active_pct: 5.0         # активация trail при падении на 5% ниже avg (в плюсе)
 activation_pct: 1.0           # (legacy, не используется в live)
@@ -51,7 +51,7 @@ funding_rate_avg: 0.0001      # средний фандинг 0.01% за инт�
 # ── Сигнал ──
 ranking_interval_min: 15      # пересчёт ранжирования каждые N минут
 min_volume_usd: 100000        # мин. объём за день (фильтр неликвида)
-min_gain_pct: 0.0             # мин. рост от open для участия в ранге
+min_gain_pct: 25.0            # порог 25 (backtest 25.07: avg +15.4% PF 8.88 WR 93.8% vs 20%)
 cooldown_symbol_hours: 24     # бан монеты после входа (часы)
 min_candles_for_rank: 10      # мин. минутных свечей с начала дня
 
