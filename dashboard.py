@@ -1203,6 +1203,7 @@ tr:hover { background: #1e2329; cursor: pointer; }
 </div>
 
 </div>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 let chart = null, series = null, eqSeries = null, balSeries = null;
@@ -2069,6 +2070,19 @@ input:focus, select:focus { border-color: #f0b90b; outline: none; }
       </div>
     </div>
   </div>
+  <!-- Tab: Chart -->
+  <div id="tab-chart" class="tab-content hidden">
+    <div class="card">
+      <h3>Chart <span class="muted" style="font-size:12px">— click a position row to load chart</span></h3>
+      <div class="form-row" style="margin-bottom:10px">
+        <label>Symbol</label>
+        <input id="chart-symbol" type="text" placeholder="e.g. EULUSDT" style="min-width:200px">
+        <button class="btn" onclick="loadPanelChart(document.getElementById('chart-symbol').value)">Load</button>
+      </div>
+      <div id="panel-chart-info" style="margin-bottom:8px;font-size:13px"></div>
+      <div id="chart-container" style="width:100%;height:450px"></div>
+    </div>
+  </div>
 </div>
 
 <!-- Modal for TP/SL move -->
@@ -2120,6 +2134,7 @@ document.querySelectorAll('.tab').forEach(t => {
     $('tab-' + t.dataset.tab).classList.remove('hidden');
     if (t.dataset.tab === 'config') loadConfig();
     if (t.dataset.tab === 'trades') loadTrades();
+    if (t.dataset.tab === 'chart' && !window._chartLoaded) { window._chartLoaded = true; }
   };
 });
 
@@ -2532,7 +2547,7 @@ select, input { background: #1e2329; border: 1px solid #2b3139; color: #eaecef; 
           <option value="240">4h</option>
           <option value="D">1D</option>
         </select>
-        <button class="btn" onclick="loadChart()">Построить</button>
+        <button class="btn" onclick="loadChart(document.getElementById('chart-symbol').value)">Построить</button>
         <span class="muted" id="chart-info"></span>
       </div>
       <div id="chart"></div>
@@ -2806,6 +2821,80 @@ async function loadChart() {
 
 // Автообновление
 loadOverview();
+
+// ── Chart ──
+let _chart = null, _candleSeries = null, _priceLines = [];
+
+async function loadPanelChart(symbol) {
+  if (!symbol) return;
+  try {
+    const r = await fetch(API('/api/live/chart?symbol=' + symbol));
+    const d = await r.json();
+    if (d.error) { toast('Chart error: ' + d.error, 'err'); return; }
+    
+    if (!_chart) {
+      _chart = LightweightCharts.createChart(document.getElementById("chart-container"), {
+        layout: { background: { color: '#0b0e11' }, textColor: '#848e9c' },
+        grid: { vertLines: { color: '#1e2329' }, horzLines: { color: '#1e2329' } },
+        timeScale: { borderColor: '#2b3139', timeVisible: true, secondsVisible: false },
+        priceScale: { borderColor: '#2b3139' },
+        crosshair: { mode: 0 },
+      });
+      _candleSeries = _chart.addCandlestickSeries({
+        upColor: '#0ecb81', downColor: '#f6465d',
+        wickUpColor: '#0ecb81', wickDownColor: '#f6465d',
+        borderVisible: false,
+      });
+    }
+    
+    // Clear old price lines
+    _priceLines.forEach(pl => _candleSeries.removePriceLine(pl));
+    _priceLines = [];
+    
+    // Set candles
+    const candles = (d.candles || []).map(c => ({
+      time: c.t, open: c.o, high: c.h, low: c.l, close: c.c,
+    }));
+    _candleSeries.setData(candles);
+    
+    // Add price lines for position
+    const pos = d.position;
+    if (pos && pos.size > 0) {
+      const avg = pos.avgPrice;
+      _priceLines.push(_candleSeries.createPriceLine({ price: avg, color: '#f0b90b', lineWidth: 2, lineStyle: 0, title: 'Entry ' + avg, axisLabelVisible: true }));
+      
+      // TP
+      if (d.dca_levels && d.dca_levels.length > 0) {
+        // TP = avg * 0.8 (20% below avg)
+        const tp = avg * 0.8;
+        _priceLines.push(_candleSeries.createPriceLine({ price: tp, color: '#0ecb81', lineWidth: 1, lineStyle: 2, title: 'TP ' + tp.toFixed(4), axisLabelVisible: true }));
+      }
+      
+      // DCA levels
+      (d.dca_levels || []).forEach((lvl, i) => {
+        _priceLines.push(_candleSeries.createPriceLine({ price: lvl, color: '#f6465d', lineWidth: 1, lineStyle: 1, title: 'DCAx' + (i+1) + ' ' + lvl.toFixed(4), axisLabelVisible: true }));
+      });
+    }
+    
+    // Info text
+    if (pos && pos.size > 0) {
+      const lastC = candles.length ? candles[candles.length-1].close : 0;
+      const pnl = (avg - lastC) * pos.size;
+      document.getElementById("panel-chart-info").innerHTML = '<span class="muted">Side:</span> ' + pos.side + 
+        ' | <span class="muted">Size:</span> ' + pos.size + 
+        ' | <span class="muted">Avg:</span> ' + avg + 
+        ' | <span class="muted">Price:</span> ' + lastC + 
+        ' | <span class="muted">uPnL:</span> <span style="color:' + (pnl>=0?'#0ecb81':'#f6465d') + '">' + pnl.toFixed(4) + '</span>';
+    } else {
+      document.getElementById("panel-chart-info").innerHTML = '<span class="muted">No open position for ' + symbol + '</span>';
+    }
+    
+    _chart.timeScale().fitContent();
+  } catch(e) {
+    toast('Chart load failed: ' + e.message, 'err');
+  }
+}
+
 setInterval(loadOverview, 5000);
 </script>
 </body></html>
