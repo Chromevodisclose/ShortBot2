@@ -850,7 +850,7 @@ async def api_live_overview(req):
         coin = acct.get("coin", [{}])
         usdt = coin[0] if coin else {}
         try:
-            available = float(usdt.get("availableToWithdraw", 0) or 0)
+            available = float(usdt.get("availableToWithdraw", 0) or usdt.get("walletBalance", 0) or 0)
         except (ValueError, TypeError):
             available = 0.0
 
@@ -866,7 +866,7 @@ async def api_live_overview(req):
                         "side": p["side"],
                         "avgPrice": float(p.get("avgPrice", 0)),
                         "leverage": p.get("leverage", ""),
-                        "takeProfit": p.get("takeProfit", ""),
+                        "takeProfit": p.get("takeProfit", "") or tp_trigger,
                         "stopLoss": p.get("stopLoss", ""),
                         "trailingStop": p.get("trailingStop", ""),
                         "unrealisedPnl": float(p.get("unrealisedPnl", 0)),
@@ -916,8 +916,13 @@ async def api_live_open(req):
                     # Подгрузим ордера по символу для DCA
                     dor = _bybit_signed_get("/v5/order/realtime", f"category=linear&symbol={p['symbol']}")
                     dca_orders = []
+                    tp_trigger = ""
                     if dor.get("retCode") == 0:
                         for o in dor["result"]["list"]:
+                            # Detect TP conditional order: Buy Market with triggerPrice
+                            tp_raw = o.get("triggerPrice", "")
+                            if o.get("side") == "Buy" and o.get("orderType") == "Market" and tp_raw and float(tp_raw) > 0:
+                                tp_trigger = tp_raw
                             dca_orders.append({
                                 "orderId": o["orderId"][:12],
                                 "side": o["side"],
@@ -925,6 +930,7 @@ async def api_live_open(req):
                                 "qty": float(o.get("qty", 0)),
                                 "type": o.get("orderType", ""),
                                 "status": o.get("orderStatus", ""),
+                                "triggerPrice": tp_raw,
                             })
                     positions.append({
                         "symbol": p["symbol"],
@@ -1952,7 +1958,7 @@ input:focus, select:focus { border-color: #f0b90b; outline: none; }
 .action-cell button { margin-right: 4px; }
 .refresh-indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #0ecb81; margin-left: 8px; animation: pulse 2s infinite; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
-</style></head><body><div class="container">
+</style><script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script></head><body><div class="container">
   <header>
     <h1>Short Bot <small>Management Panel</small></h1>
     <div class="nav">
@@ -2187,7 +2193,7 @@ async function loadPositions() {
       for (const p of positions) {
         const pnlCls = p.unrealisedPnl > 0 ? 'pos' : 'neg';
         html += '<tr>'
-          + '<td><b>' + p.symbol + '</b></td>'
+          + '<td><b><a href="#" onclick="chartFromPos(\'' + p.symbol + '\');return false" style="color:#4a9eff;text-decoration:none">' + p.symbol + '</a></b></td>'
           + '<td>' + p.side + '</td>'
           + '<td>' + p.size + '</td>'
           + '<td>' + fmt(p.avgPrice, 6) + '</td>'
@@ -2431,6 +2437,15 @@ function refreshAll() {
 loadOverview();
 loadBotStatus();
 loadPositions();
+function chartFromPos(symbol) {
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+  document.querySelector('[data-tab="chart"]').classList.add('active');
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
+  document.getElementById('tab-chart').classList.remove('hidden');
+  document.getElementById('chart-symbol').value = symbol;
+  loadPanelChart(symbol);
+}
+
 setInterval(refreshAll, 5000);
 </script>
 </body></html>"""
