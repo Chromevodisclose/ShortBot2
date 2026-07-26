@@ -866,7 +866,7 @@ async def api_live_overview(req):
                         "side": p["side"],
                         "avgPrice": float(p.get("avgPrice", 0)),
                         "leverage": p.get("leverage", ""),
-                        "takeProfit": p.get("takeProfit", "") or tp_trigger,
+                        "takeProfit": p.get("takeProfit", ""),
                         "stopLoss": p.get("stopLoss", ""),
                         "trailingStop": p.get("trailingStop", ""),
                         "unrealisedPnl": float(p.get("unrealisedPnl", 0)),
@@ -2115,7 +2115,7 @@ input:focus, select:focus { border-color: #f0b90b; outline: none; }
 
 <script>
 const TOKEN = new URLSearchParams(location.search).get('token') || 'piktor2026';
-const API = (path) => path + '?token=' + TOKEN;
+const API = (path) => path + (path.includes('?') ? '&' : '?') + 'token=' + TOKEN;
 let modalAction = null;
 let modalData = {};
 
@@ -2444,8 +2444,10 @@ function chartFromPos(symbol) {
   document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
   document.getElementById('tab-chart').classList.remove('hidden');
   document.getElementById('chart-symbol').value = symbol;
-  loadPanelChart(symbol);
+  setTimeout(function() { loadPanelChart(symbol); }, 50);
 }
+
+let _chart = null, _candleSeries = null, _priceLines = [];
 
 async function loadPanelChart(symbol) {
   if (!symbol) return;
@@ -2481,8 +2483,8 @@ async function loadPanelChart(symbol) {
     
     // Add price lines for position
     const pos = d.position;
+    const avg = pos ? pos.avgPrice : 0;
     if (pos && pos.size > 0) {
-      const avg = pos.avgPrice;
       _priceLines.push(_candleSeries.createPriceLine({ price: avg, color: '#f0b90b', lineWidth: 2, lineStyle: 0, title: 'Entry ' + avg, axisLabelVisible: true }));
       
       // TP
@@ -2502,11 +2504,12 @@ async function loadPanelChart(symbol) {
     if (pos && pos.size > 0) {
       const lastC = candles.length ? candles[candles.length-1].close : 0;
       const pnl = (avg - lastC) * pos.size;
+      const pnlColor = pnl >= 0 ? '#0ecb81' : '#f6465d';
       document.getElementById("panel-chart-info").innerHTML = '<span class="muted">Side:</span> ' + pos.side + 
         ' | <span class="muted">Size:</span> ' + pos.size + 
         ' | <span class="muted">Avg:</span> ' + avg + 
         ' | <span class="muted">Price:</span> ' + lastC + 
-        ' | <span class="muted">uPnL:</span> <span style="color:' + (pnl>=0?'#0ecb81':'#f6465d') + '">' + pnl.toFixed(4) + '</span>';
+        ' | <span class="muted">uPnL:</span> <span style="color:' + pnlColor + '">' + pnl.toFixed(4) + '</span>';
     } else {
       document.getElementById("panel-chart-info").innerHTML = '<span class="muted">No open position for ' + symbol + '</span>';
     }
@@ -2909,7 +2912,6 @@ async function loadChart() {
 loadOverview();
 
 // ── Chart ──
-let _chart = null, _candleSeries = null, _priceLines = [];
 
 
 
