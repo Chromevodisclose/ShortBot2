@@ -408,6 +408,436 @@ def _bybit_signed_get(path, params=""):
     return json.loads(urllib.request.urlopen(req, timeout=10).read())
 
 
+# ═══════════════════════════════════════════════════════
+# MANAGEMENT PANEL API — config / bot control / orders
+# ═══════════════════════════════════════════════════════
+
+import subprocess, re
+
+# Keys managed by the config panel
+CFG_KEYS_SCALAR = {
+    "min_gain_pct": float,
+    "trail_pct": float,
+    "sl_pct": float,
+    "dca_max_count": int,
+    "max_open_positions": int,
+    "risk_notional_pct": float,
+    "leverage": float,
+    "max_daily_entries": int,
+    "ranking_interval_min": int,
+    "min_volume_usd": float,
+}
+CFG_KEYS_LIST = {"tp_chain", "dca_trigger_pct"}
+
+
+def _bybit_signed_post(path, body):
+    """Signed POST to Bybit (JSON body). Mirror of _bybit_signed_get."""
+    import hashlib, hmac, urllib.request
+    api_file = os.path.expanduser("~/.bybit_api")
+    if not os.path.exists(api_file):
+        api_file = "/root/.bybit_api"
+    if not os.path.exists(api_file):
+        return {"retCode": -1, "retMsg": "no api keys"}
+    key, secret = open(api_file).read().strip().split("\n")
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    json_body = json.dumps(body, separators=(",", ":"))
+    sign_str = f"{ts}{key}{recv}{json_body}"
+    sign = hmac.new(secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
+    url = f"https://api.bybit.com{path}"
+    req = urllib.request.Request(url, data=json_body.encode(), headers={
+        "X-BAPI-SIGN-TYPE": "SHA256", "X-BAPI-SIGN": sign,
+        "X-BAPI-API-KEY": key, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv,
+        "Content-Type": "application/json",
+    }, method="POST")
+    try:
+        return json.loads(urllib.request.urlopen(req, timeout=10).read())
+    except urllib.error.HTTPError as e:
+        return {"retCode": e.code, "retMsg": f"HTTP {e.code}: {e.read().decode()}"}
+    except Exception as e:
+        return {"retCode": -1, "retMsg": str(e)}
+
+
+def _save_cfg_partial(updates):
+    """Update only changed keys in config.yaml, preserving comments/formatting.
+    Line-by-line replacement for scalar keys; list keys replace the whole list inline.
+    Returns (ok, msg, updated_keys)."""
+    if not CFG_F.exists():
+        return False, "config.yaml not found", []
+    lines = CFG_F.read_text().splitlines()
+    updated = []
+    for key, val in updates.items():
+        if key in CFG_KEYS_LIST:
+            # list value — format as [v1, v2, ...]
+            if isinstance(val, str):
+                parts = [p.strip() for p in val.strip("[]").split(",") if p.strip()]
+            else:
+                parts = list(val)
+            list_str = "[" + ", ".join(str(p) for p in parts) + "]"
+            # find existing line with key: [...]
+            found = False
+            for i, ln in enumerate(lines):
+                stripped = ln.lstrip()
+                if stripped.startswith(f"{key}:") or stripped.startswith(f"{key} :"):
+                    # preserve leading whitespace
+                    indent = ln[:len(ln) - len(stripped)]
+                    # keep inline comment if present after the list
+                    lines[i] = f"{indent}{key}: {list_str}"
+                    found = True
+                    updated.append(key)
+                    break
+            if not found:
+                lines.append(f"{key}: {list_str}")
+                updated.append(key)
+        elif key in CFG_KEYS_SCALAR:
+            found = False
+            for i, ln in enumerate(lines):
+                stripped = ln.lstrip()
+                if stripped.startswith(f"{key}:") or stripped.startswith(f"{key} :"):
+                    indent = ln[:len(ln) - len(stripped)]
+                    lines[i] = f"{indent}{key}: {val}"
+                    found = True
+                    updated.append(key)
+                    break
+            if not found:
+                lines.append(f"{key}: {val}")
+                updated.append(key)
+        else:
+            # unknown key — skip
+            continue
+    CFG_F.write_text("\n".join(lines) + "\n")
+    return True, f"updated {len(updated)} keys: {', '.join(updated)}", updated
+
+
+async def api_config_get(req):
+    """GET /api/config — return current config values."""
+    try:
+        cfg = load_cfg()
+        # also return raw list keys (load_cfg parses them as strings if not float)
+        out = {}
+        for k in CFG_KEYS_SCALAR:
+            out[k] = cfg.get(k)
+        for k in CFG_KEYS_LIST:
+            v = cfg.get(k)
+            # load_cfg may return a string like "[10.0, 15.0, 20.0, 25.0, 30.0]"
+            if isinstance(v, str):
+                out[k] = [p.strip() for p in v.strip("[]").split(",") if p.strip()]
+            elif isinstance(v, list):
+                out[k] = v
+            else:
+                out[k] = v
+        return web.json_response({"config": out})
+    except Exception as e:
+        return web.json_response({"error": str(e)})
+
+
+async def api_config_save(req):
+    """POST /api/config — save config.yaml parameters (partial update)."""
+    try:
+        body = await req.json()
+    except Exception:
+        try:
+            body = dict(req.query)
+        except Exception:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+    updates = {}
+    for k in CFG_KEYS_SCALAR:
+        if k in body and body[k] is not None and str(body[k]).strip() != "":
+            try:
+                updates[k] = CFG_KEYS_SCALAR[k](body[k])
+            except (ValueError, TypeError):
+                return web.json_response({"error": f"invalid value for {k}: {body[k]}"}, status=400)
+    for k in CFG_KEYS_LIST:
+        if k in body and body[k] is not None:
+            updates[k] = body[k]
+    if not updates:
+        return web.json_response({"ok": False, "msg": "no keys to update"})
+    ok, msg, updated = _save_cfg_partial(updates)
+    return web.json_response({"ok": ok, "msg": msg, "updated": updated})
+
+
+async def api_bot_restart(req):
+    """POST /api/bot/restart — restart short-bot.service via systemctl."""
+    try:
+        r = subprocess.run(["systemctl", "restart", "short-bot.service"],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            return web.json_response({"ok": True, "msg": "short-bot.service restarted"})
+        else:
+            return web.json_response({"ok": False, "msg": r.stderr or r.stdout or "restart failed"})
+    except subprocess.TimeoutExpired:
+        return web.json_response({"ok": False, "msg": "restart timed out (30s)"})
+    except Exception as e:
+        return web.json_response({"ok": False, "msg": str(e)})
+
+
+async def api_bot_status(req):
+    """POST /api/bot/status — bot process status (running/stopped, PID, uptime)."""
+    try:
+        r = subprocess.run(["systemctl", "is-active", "short-bot.service"],
+                           capture_output=True, text=True, timeout=10)
+        active = r.stdout.strip() == "active"
+        # get PID + uptime via systemctl show
+        r2 = subprocess.run(["systemctl", "show", "short-bot.service",
+                             "--property=MainPID,ActiveEnterTimestamp,ExecMainStartTimestamp"],
+                            capture_output=True, text=True, timeout=10)
+        info = {}
+        for part in r2.stdout.strip().split():
+            if "=" in part:
+                k, _, v = part.partition("=")
+                info[k] = v
+        pid = int(info.get("MainPID", 0) or 0)
+        # uptime from ActiveEnterTimestamp (e.g. "Tue 2025-01-01 12:00:00 UTC")
+        uptime_sec = None
+        ts_str = info.get("ExecMainStartTimestamp") or info.get("ActiveEnterTimestamp")
+        if ts_str:
+            try:
+                # parse "Tue 2025-01-01 12:00:00 UTC" → strip weekday
+                # systemctl format: "Tue 2025-01-01 12:00:00 UTC"
+                parts = ts_str.split(None, 1)
+                dt_str = parts[1] if len(parts) > 1 else ts_str
+                dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S UTC")
+                uptime_sec = (datetime.utcnow() - dt).total_seconds()
+            except Exception:
+                uptime_sec = None
+        return web.json_response({
+            "active": active,
+            "status": "running" if active else "stopped",
+            "pid": pid,
+            "uptime_sec": uptime_sec,
+            "uptime_str": fmt_dur(uptime_sec) if uptime_sec else None,
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)})
+
+
+async def api_position_close(req):
+    """POST /api/position/close — close a position manually via executor.close_market."""
+    try:
+        body = await req.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    symbol = body.get("symbol", "").upper().strip()
+    qty = body.get("qty")
+    if not symbol:
+        return web.json_response({"error": "symbol required"}, status=400)
+    try:
+        import executor
+        if qty is None or float(qty) <= 0:
+            # get position size from Bybit
+            pos = executor.get_position(symbol)
+            if not pos or pos["size"] == 0:
+                return web.json_response({"error": f"no open position for {symbol}"})
+            qty = pos["size"]
+        qty = float(qty)
+        # cancel all open orders first (DCA limits, TP/SL conditionals)
+        executor.cancel_all(symbol)
+        oid = executor.close_market(symbol, qty)
+        if oid:
+            return web.json_response({"ok": True, "orderId": oid, "msg": f"closed {symbol} qty={qty}"})
+        else:
+            return web.json_response({"ok": False, "msg": f"close_market returned None for {symbol}"})
+    except Exception as e:
+        return web.json_response({"error": str(e)})
+
+
+async def api_order_cancel(req):
+    """POST /api/order/cancel — cancel an order via executor.cancel_order."""
+    try:
+        body = await req.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    symbol = body.get("symbol", "").upper().strip()
+    order_id = body.get("order_id", "").strip()
+    if not symbol or not order_id:
+        return web.json_response({"error": "symbol and order_id required"}, status=400)
+    try:
+        import executor
+        ok = executor.cancel_order(symbol, order_id)
+        return web.json_response({"ok": ok, "msg": "cancelled" if ok else "cancel failed"})
+    except Exception as e:
+        return web.json_response({"error": str(e)})
+
+
+async def api_tp_move(req):
+    """POST /api/tp/move — move TP for a position.
+    Cancel old TP conditional order, set new via live_trader._set_tp_order."""
+    try:
+        body = await req.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    symbol = body.get("symbol", "").upper().strip()
+    trigger_price = body.get("trigger_price") or body.get("tp_price")
+    qty = body.get("qty")
+    if not symbol or not trigger_price:
+        return web.json_response({"error": "symbol and trigger_price required"}, status=400)
+    try:
+        import executor, live_trader
+        trigger_price = float(trigger_price)
+        # get current position for qty
+        pos = executor.get_position(symbol)
+        if not pos or pos["size"] == 0:
+            return web.json_response({"error": f"no open position for {symbol}"})
+        qty = float(qty) if qty else pos["size"]
+        # cancel existing conditional orders (TP) — cancel_all will also remove DCA limits
+        # We only want to cancel TP, so find TP-type orders
+        orders = executor.get_open_orders(symbol)
+        tp_cancelled = 0
+        for o in orders:
+            # TP conditional orders have triggerPrice > 0 and orderType Market
+            if o.get("orderType") == "Market" and o.get("triggerPrice") and float(o.get("triggerPrice", 0)) > 0:
+                if executor.cancel_order(symbol, o["orderId"]):
+                    tp_cancelled += 1
+        # set new TP
+        oid = live_trader._set_tp_order(symbol, qty, trigger_price, order_link_id=f"TP-{symbol}-{int(time.time())}")
+        if oid:
+            return web.json_response({"ok": True, "orderId": oid, "tp_cancelled": tp_cancelled,
+                                       "msg": f"TP moved to {trigger_price} for {symbol} (cancelled {tp_cancelled} old)"})
+        else:
+            return web.json_response({"ok": False, "msg": f"_set_tp_order failed for {symbol}",
+                                       "tp_cancelled": tp_cancelled})
+    except Exception as e:
+        return web.json_response({"error": str(e)})
+
+
+async def api_sl_move(req):
+    """POST /api/sl/move — move SL for a position via executor.set_trading_stop."""
+    try:
+        body = await req.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    symbol = body.get("symbol", "").upper().strip()
+    stop_loss = body.get("stop_loss") or body.get("sl_price")
+    take_profit = body.get("take_profit") or body.get("tp_price") or 0
+    if not symbol or not stop_loss:
+        return web.json_response({"error": "symbol and stop_loss required"}, status=400)
+    try:
+        import executor
+        stop_loss = float(stop_loss)
+        take_profit = float(take_profit) if take_profit else 0
+        ok = executor.set_trading_stop(symbol, take_profit=take_profit, stop_loss=stop_loss)
+        return web.json_response({"ok": ok, "msg": f"SL set to {stop_loss}" if ok else "set_trading_stop failed"})
+    except Exception as e:
+        return web.json_response({"error": str(e)})
+
+
+async def api_position_open(req):
+    """POST /api/position/open — manually open a short."""
+    try:
+        body = await req.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    symbol = body.get("symbol", "").upper().strip()
+    mode = body.get("mode", "qty")  # "qty" or "notional"
+    qty_val = body.get("qty")
+    notional_pct = body.get("notional_pct")
+    leverage = body.get("leverage")
+    if not symbol:
+        return web.json_response({"error": "symbol required"}, status=400)
+    try:
+        import executor, live_trader
+        # get balance
+        balance = executor.get_balance()
+        if not balance or balance <= 0:
+            return web.json_response({"error": "cannot get balance from Bybit"})
+        # get current price
+        price = executor.get_ticker(symbol)
+        if not price or price <= 0:
+            return web.json_response({"error": f"cannot get price for {symbol}"})
+        # leverage from body or config
+        if not leverage:
+            leverage = load_cfg().get("leverage", 3)
+        leverage = float(leverage)
+        # qty calculation
+        if mode == "notional" and notional_pct:
+            notional = balance * float(notional_pct) / 100
+            qty = notional / price
+        elif qty_val:
+            qty = float(qty_val)
+        else:
+            return web.json_response({"error": "qty or notional_pct required"})
+        # set leverage
+        executor.set_leverage(symbol, leverage)
+        # place market short
+        oid = executor.place_market_short(symbol, qty, leverage=leverage)
+        if not oid:
+            return web.json_response({"ok": False, "msg": f"place_market_short failed for {symbol}"})
+        time.sleep(1)
+        # get fill
+        pos = executor.get_position(symbol)
+        if not pos or pos["size"] == 0:
+            return web.json_response({"ok": True, "orderId": oid, "msg": "order placed but position not found yet"})
+        fill_price = pos["avgPrice"]
+        actual_qty = pos["size"]
+        # set TP from config tp_chain[0]
+        cfg = load_cfg()
+        tp_chain = cfg.get("tp_chain", [20.0])
+        if isinstance(tp_chain, str):
+            tp_chain = [float(p.strip()) for p in tp_chain.strip("[]").split(",") if p.strip()]
+        tp_pct = float(tp_chain[0]) if tp_chain else 20.0
+        tp = fill_price * (1 - tp_pct / 100)
+        tp_oid = live_trader._set_tp_order(symbol, actual_qty, tp,
+                                            order_link_id=f"TP-{symbol}-{int(time.time())}")
+        # set DCA limit orders
+        dca_trigger = cfg.get("dca_trigger_pct", [10.0, 15.0, 20.0, 25.0, 30.0])
+        if isinstance(dca_trigger, str):
+            dca_trigger = [float(p.strip()) for p in dca_trigger.strip("[]").split(",") if p.strip()]
+        dca_mult = float(cfg.get("dca_qty_multiplier", 1.0))
+        dca_oids = {}
+        for i, pct_lvl in enumerate(dca_trigger):
+            dca_price = fill_price * (1 + float(pct_lvl) / 100)
+            dca_qty = actual_qty * dca_mult
+            doid = executor.place_dca_limit(symbol, dca_qty, dca_price)
+            if doid:
+                dca_oids[i + 1] = doid
+        # set SL if sl_pct > 0
+        sl_pct = float(cfg.get("sl_pct", 0))
+        sl_oid = None
+        if sl_pct > 0:
+            sl_price = fill_price * (1 + sl_pct / 100)
+            sl_oid = executor.set_stop_loss_order(symbol, actual_qty, sl_price,
+                                                   order_link_id=f"SL-{symbol}-{int(time.time())}")
+        return web.json_response({
+            "ok": True, "orderId": oid, "tp_orderId": tp_oid,
+            "fill_price": fill_price, "qty": actual_qty,
+            "tp": tp, "dca_orders": dca_oids, "sl_orderId": sl_oid,
+            "msg": f"opened short {symbol} qty={actual_qty} @ {fill_price}, TP={tp}, DCA={len(dca_oids)} levels"
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)})
+
+
+async def api_orders(req):
+    """GET /api/orders — all open orders across symbols (Bybit realtime)."""
+    try:
+        dor = _bybit_signed_get("/v5/order/realtime", "category=linear&settleCoin=USDT")
+        orders = []
+        if dor.get("retCode") == 0:
+            for o in dor["result"]["list"]:
+                orders.append({
+                    "orderId": o.get("orderId", ""),
+                    "symbol": o.get("symbol", ""),
+                    "side": o.get("side", ""),
+                    "orderType": o.get("orderType", ""),
+                    "price": o.get("price", ""),
+                    "qty": o.get("qty", ""),
+                    "filledQty": o.get("cumExecQty", "0"),
+                    "status": o.get("orderStatus", ""),
+                    "triggerPrice": o.get("triggerPrice", ""),
+                    "reduceOnly": o.get("reduceOnly", ""),
+                    "timeInForce": o.get("timeInForce", ""),
+                    "createdTime": o.get("createdTime", ""),
+                    "orderLinkId": o.get("orderLinkId", ""),
+                })
+        # sort by createdTime desc
+        orders.sort(key=lambda x: int(x.get("createdTime", 0) or 0), reverse=True)
+        return web.json_response({"orders": orders, "count": len(orders)})
+    except Exception as e:
+        return web.json_response({"error": str(e)})
+
+
+
+
 async def api_live_overview(req):
     """Обзор LIVE — реальные баланс/позиции с биржи."""
     try:
@@ -1453,6 +1883,555 @@ async def live_page(request):
     return web.Response(text=html, headers={"Content-Type": "text/html; charset=utf-8"})
 
 
+PANEL_HTML = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Short Bot — Panel</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #0b0e11; color: #eaecef; font: 14px/1.4 -apple-system,Segoe UI,Roboto,sans-serif; }
+.container { max-width: 1400px; margin: 0 auto; padding: 12px; }
+header { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #1e2329; margin-bottom: 12px; flex-wrap: wrap; gap: 8px; }
+header h1 { font-size: 18px; color: #f0b90b; }
+header h1 small { color: #848e9c; font-weight: normal; font-size: 12px; }
+.nav { display: flex; gap: 8px; align-items: center; }
+.nav a { color: #4a9eff; text-decoration: none; padding: 6px 14px; background: #1e2329; border-radius: 6px; font-size: 13px; }
+.nav a:hover { background: #2b3139; }
+.topbar { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.stat { background: #181a20; border: 1px solid #1e2329; border-radius: 8px; padding: 10px 14px; }
+.stat .lbl { color: #848e9c; font-size: 11px; text-transform: uppercase; margin-bottom: 2px; }
+.stat .val { font-size: 20px; font-weight: 600; }
+.stat .val.pos { color: #0ecb81; }
+.stat .val.neg { color: #f6465d; }
+.bot-dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+.bot-dot.on { background: #0ecb81; box-shadow: 0 0 6px #0ecb81; }
+.bot-dot.off { background: #f6465d; box-shadow: 0 0 6px #f6465d; }
+.tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 12px; }
+.tab { padding: 8px 16px; background: #1e2329; border-radius: 6px 6px 0 0; cursor: pointer; color: #848e9c; font-size: 13px; border: 1px solid transparent; }
+.tab.active { background: #181a20; color: #f0b90b; border-color: #1e2329; border-bottom-color: #181a20; font-weight: 600; }
+.tab:hover { color: #eaecef; }
+.card { background: #181a20; border: 1px solid #1e2329; border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+.card h3 { font-size: 13px; color: #848e9c; text-transform: uppercase; margin-bottom: 10px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { padding: 7px 8px; text-align: left; border-bottom: 1px solid #1e2329; }
+th { color: #848e9c; font-size: 11px; text-transform: uppercase; }
+tr:hover { background: #1e2329; }
+.pos { color: #0ecb81; } .neg { color: #f6465d; }
+.muted { color: #848e9c; }
+input, select, textarea { background: #1e2329; border: 1px solid #2b3139; color: #eaecef; padding: 6px 10px; border-radius: 4px; font-size: 13px; }
+input:focus, select:focus { border-color: #f0b90b; outline: none; }
+.btn { padding: 6px 14px; background: #f0b90b; color: #0b0e11; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 13px; }
+.btn:hover { background: #d4a517; }
+.btn.danger { background: #f6465d; color: #fff; }
+.btn.danger:hover { background: #d63d52; }
+.btn.small { padding: 3px 10px; font-size: 12px; }
+.btn.green { background: #0ecb81; color: #0b0e11; }
+.btn.green:hover { background: #0ab76e; }
+.btn-outline { background: transparent; border: 1px solid #2b3139; color: #eaecef; }
+.btn-outline:hover { border-color: #f0b90b; color: #f0b90b; }
+.form-row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+.form-row label { min-width: 180px; color: #848e9c; font-size: 13px; }
+.form-row input { min-width: 120px; }
+.cfg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.cfg-item { display: flex; flex-direction: column; gap: 4px; }
+.cfg-item label { color: #848e9c; font-size: 12px; }
+.cfg-item input { width: 100%; }
+#toast { position: fixed; bottom: 20px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; }
+.toast { padding: 10px 18px; border-radius: 6px; font-size: 13px; font-weight: 600; min-width: 200px; animation: slideIn 0.3s; }
+.toast.ok { background: #0ecb81; color: #0b0e11; }
+.toast.err { background: #f6465d; color: #fff; }
+.toast.info { background: #4a9eff; color: #fff; }
+@keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+.modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 8000; display: none; justify-content: center; align-items: center; }
+.modal { background: #181a20; border: 1px solid #2b3139; border-radius: 8px; padding: 20px; min-width: 360px; max-width: 500px; }
+.modal h3 { color: #f0b90b; margin-bottom: 14px; }
+.modal .form-row { margin-bottom: 12px; }
+.hidden { display: none !important; }
+.action-cell { white-space: nowrap; }
+.action-cell button { margin-right: 4px; }
+.refresh-indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #0ecb81; margin-left: 8px; animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+</style></head><body><div class="container">
+  <header>
+    <h1>Short Bot <small>Management Panel</small></h1>
+    <div class="nav">
+      <a href="/live?token=piktor2026">Live Dashboard</a>
+      <a href="/panel?token=piktor2026" class="active">Panel</a>
+    </div>
+  </header>
+
+  <div class="topbar" id="topbar">
+    <div class="stat"><div class="lbl">Balance</div><div class="val" id="s-balance">—</div></div>
+    <div class="stat"><div class="lbl">Equity</div><div class="val" id="s-equity">—</div></div>
+    <div class="stat"><div class="lbl">Avail Margin</div><div class="val" id="s-avail">—</div></div>
+    <div class="stat"><div class="lbl">Unreal. PnL</div><div class="val" id="s-upnl">—</div></div>
+    <div class="stat"><div class="lbl">Open Positions</div><div class="val" id="s-open">—</div></div>
+    <div class="stat"><div class="lbl">Open Orders</div><div class="val" id="s-orders">—</div></div>
+    <div class="stat"><div class="lbl">Bot Status</div><div class="val" id="s-bot" style="font-size:16px"><span class="bot-dot off" id="bot-dot"></span><span id="bot-text">—</span></div></div>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="positions">Positions</div>
+    <div class="tab" data-tab="orders">Orders</div>
+    <div class="tab" data-tab="config">Config</div>
+    <div class="tab" data-tab="trades">Trades</div>
+    <div class="tab" data-tab="open">Open Position</div>
+  </div>
+
+  <!-- Tab: Positions -->
+  <div id="tab-positions" class="tab-content">
+    <div class="card">
+      <h3>Open Positions (Bybit realtime) <span class="refresh-indicator"></span></h3>
+      <table id="pos-table"><thead><tr>
+        <th>Symbol</th><th>Side</th><th>Size</th><th>Avg Price</th><th>Lev</th>
+        <th>uPnL</th><th>TP</th><th>SL</th><th>Trail</th><th>Actions</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+
+  <!-- Tab: Orders -->
+  <div id="tab-orders" class="tab-content hidden">
+    <div class="card">
+      <h3>Open Orders (Bybit realtime) <span class="refresh-indicator"></span></h3>
+      <table id="ord-table"><thead><tr>
+        <th>Time</th><th>Symbol</th><th>Side</th><th>Type</th><th>Price</th>
+        <th>Trigger</th><th>Qty</th><th>Filled</th><th>ReduceOnly</th><th>Status</th><th>Action</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+
+  <!-- Tab: Config -->
+  <div id="tab-config" class="tab-content hidden">
+    <div class="card">
+      <h3>Bot Configuration (config.yaml)</h3>
+      <div class="cfg-grid" id="cfg-form">
+        <div class="cfg-item"><label>min_gain_pct (%)</label><input id="cfg-min_gain_pct" type="number" step="0.1"></div>
+        <div class="cfg-item"><label>tp_chain (list, comma-sep)</label><input id="cfg-tp_chain" type="text" placeholder="20.0, 20.0, 20.0"></div>
+        <div class="cfg-item"><label>trail_pct (%)</label><input id="cfg-trail_pct" type="number" step="0.1"></div>
+        <div class="cfg-item"><label>sl_pct (%)</label><input id="cfg-sl_pct" type="number" step="0.1"></div>
+        <div class="cfg-item"><label>dca_trigger_pct (list)</label><input id="cfg-dca_trigger_pct" type="text" placeholder="10.0, 15.0, 20.0, 25.0, 30.0"></div>
+        <div class="cfg-item"><label>dca_max_count</label><input id="cfg-dca_max_count" type="number" step="1"></div>
+        <div class="cfg-item"><label>max_open_positions</label><input id="cfg-max_open_positions" type="number" step="1"></div>
+        <div class="cfg-item"><label>risk_notional_pct (%)</label><input id="cfg-risk_notional_pct" type="number" step="0.1"></div>
+        <div class="cfg-item"><label>leverage (x)</label><input id="cfg-leverage" type="number" step="1"></div>
+        <div class="cfg-item"><label>max_daily_entries</label><input id="cfg-max_daily_entries" type="number" step="1"></div>
+        <div class="cfg-item"><label>ranking_interval_min</label><input id="cfg-ranking_interval_min" type="number" step="1"></div>
+        <div class="cfg-item"><label>min_volume_usd</label><input id="cfg-min_volume_usd" type="number" step="1000"></div>
+      </div>
+      <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn" onclick="saveConfig()">Save Config</button>
+        <button class="btn green" onclick="applyToBot()">Apply to Bot (Restart)</button>
+        <button class="btn-outline" onclick="loadConfig()">Reload from File</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab: Trades -->
+  <div id="tab-trades" class="tab-content hidden">
+    <div class="card">
+      <h3>Closed Trade History (Bybit)</h3>
+      <table id="trades-table"><thead><tr>
+        <th>Date</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>Lev</th><th>PnL</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+
+  <!-- Tab: Open Position -->
+  <div id="tab-open" class="tab-content hidden">
+    <div class="card">
+      <h3>Manually Open Short Position</h3>
+      <div class="form-row">
+        <label>Symbol</label>
+        <input id="open-symbol" type="text" placeholder="e.g. EPICUSDT" style="min-width:200px">
+      </div>
+      <div class="form-row">
+        <label>Size mode</label>
+        <select id="open-mode" onchange="toggleOpenMode()">
+          <option value="qty">Qty (coins)</option>
+          <option value="notional">Notional % of balance</option>
+        </select>
+      </div>
+      <div class="form-row" id="open-qty-row">
+        <label>Qty (coins)</label>
+        <input id="open-qty" type="number" step="0.0001" placeholder="0.0">
+      </div>
+      <div class="form-row hidden" id="open-notional-row">
+        <label>Notional % of balance</label>
+        <input id="open-notional" type="number" step="0.1" placeholder="10.0">
+      </div>
+      <div class="form-row">
+        <label>Leverage (from config if empty)</label>
+        <input id="open-leverage" type="number" step="1" placeholder="e.g. 3">
+      </div>
+      <div class="form-row">
+        <button class="btn danger" onclick="openPosition()">OPEN SHORT (Market)</button>
+        <span class="muted">This will place a real market short order on Bybit + set TP/DCA from config.</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Modal for TP/SL move -->
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal" id="modal-box">
+    <h3 id="modal-title">Move TP</h3>
+    <div class="form-row">
+      <label>Symbol</label>
+      <span id="modal-symbol" class="muted"></span>
+    </div>
+    <div class="form-row">
+      <label id="modal-price-label">Trigger Price</label>
+      <input id="modal-price" type="number" step="0.000001">
+    </div>
+    <div class="form-row" style="justify-content:flex-end;margin-top:16px">
+      <button class="btn-outline" onclick="closeModal()">Cancel</button>
+      <button class="btn" id="modal-confirm" onclick="confirmModal()">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const TOKEN = new URLSearchParams(location.search).get('token') || 'piktor2026';
+const API = (path) => path + '?token=' + TOKEN;
+let modalAction = null;
+let modalData = {};
+
+function fmt(n, d=2) { if (n == null || n === '' || n === '') return '—'; const v = Number(n); return isNaN(v) ? n : v.toFixed(d); }
+function pnlClass(n) { return Number(n) > 0 ? 'pos' : Number(n) < 0 ? 'neg' : ''; }
+function $(id) { return document.getElementById(id); }
+
+// ── Toast ──
+function toast(msg, type='info') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = msg;
+  $('toast').appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity 0.5s'; setTimeout(() => el.remove(), 500); }, 4000);
+}
+
+// ── Tabs ──
+document.querySelectorAll('.tab').forEach(t => {
+  t.onclick = () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
+    $('tab-' + t.dataset.tab).classList.remove('hidden');
+    if (t.dataset.tab === 'config') loadConfig();
+    if (t.dataset.tab === 'trades') loadTrades();
+  };
+});
+
+// ── Overview / Top bar ──
+async function loadOverview() {
+  try {
+    const r = await fetch(API('/api/live/overview'));
+    const d = await r.json();
+    if (d.error) { $('s-balance').textContent = 'ERR'; return; }
+    $('s-balance').textContent = '$' + fmt(d.balance);
+    $('s-equity').textContent = '$' + fmt(d.equity);
+    $('s-avail').textContent = '$' + fmt(d.available);
+    const upnl = d.positions ? d.positions.reduce((s, p) => s + (p.unrealisedPnl || 0), 0) : 0;
+    const upnlEl = $('s-upnl');
+    upnlEl.textContent = '$' + fmt(upnl);
+    upnlEl.className = 'val ' + pnlClass(upnl);
+    $('s-open').textContent = d.open_count;
+    $('s-orders').textContent = d.open_orders;
+  } catch(e) { $('s-balance').textContent = 'ERR'; }
+}
+
+async function loadBotStatus() {
+  try {
+    const r = await fetch(API('/api/bot/status'), { method: 'POST' });
+    const d = await r.json();
+    if (d.error) { $('bot-text').textContent = 'ERR'; return; }
+    const dot = $('bot-dot');
+    const txt = $('bot-text');
+    if (d.active) {
+      dot.className = 'bot-dot on';
+      txt.textContent = 'Running (PID ' + d.pid + (d.uptime_str ? ', ' + d.uptime_str : '') + ')';
+    } else {
+      dot.className = 'bot-dot off';
+      txt.textContent = 'Stopped';
+    }
+  } catch(e) { $('bot-text').textContent = 'ERR'; }
+}
+
+// ── Positions tab ──
+async function loadPositions() {
+  try {
+    const r = await fetch(API('/api/live/open'));
+    const d = await r.json();
+    if (d.error) { $('pos-table').querySelector('tbody').innerHTML = '<tr><td colspan=10 class="muted">' + d.error + '</td></tr>'; return; }
+    let html = '';
+    const positions = d.positions || [];
+    if (positions.length === 0) {
+      html = '<tr><td colspan=10 class="muted">No open positions</td></tr>';
+    } else {
+      for (const p of positions) {
+        const pnlCls = p.unrealisedPnl > 0 ? 'pos' : 'neg';
+        html += '<tr>'
+          + '<td><b>' + p.symbol + '</b></td>'
+          + '<td>' + p.side + '</td>'
+          + '<td>' + p.size + '</td>'
+          + '<td>' + fmt(p.avgPrice, 6) + '</td>'
+          + '<td>' + p.leverage + 'x</td>'
+          + '<td class="' + pnlCls + '">' + fmt(p.unrealisedPnl) + '</td>'
+          + '<td>' + (p.takeProfit || '—') + '</td>'
+          + '<td>' + (p.stopLoss || '—') + '</td>'
+          + '<td>' + (p.trailingStop && p.trailingStop !== '0' ? p.trailingStop : '—') + '</td>'
+          + '<td class="action-cell">'
+          +   '<button class="btn danger small" onclick="closePosition(\\'' + p.symbol + '\\',' + p.size + ')">Close</button>'
+          +   '<button class="btn small" onclick="openModal(\\'tp\\', \\'' + p.symbol + '\\', ' + p.size + ', ' + (p.takeProfit && p.takeProfit !== '0' ? p.takeProfit : '') + ')">Move TP</button>'
+          +   '<button class="btn small" onclick="openModal(\\'sl\\', \\'' + p.symbol + '\\', ' + p.size + ', ' + (p.stopLoss && p.stopLoss !== '0' ? p.stopLoss : '') + ')">Move SL</button>'
+          + '</td></tr>';
+      }
+    }
+    $('pos-table').querySelector('tbody').innerHTML = html;
+  } catch(e) { $('pos-table').querySelector('tbody').innerHTML = '<tr><td colspan=10>ERR: ' + e + '</td></tr>'; }
+}
+
+// ── Orders tab ──
+async function loadOrders() {
+  try {
+    const r = await fetch(API('/api/orders'));
+    const d = await r.json();
+    if (d.error) { $('ord-table').querySelector('tbody').innerHTML = '<tr><td colspan=11 class="muted">' + d.error + '</td></tr>'; return; }
+    let html = '';
+    const orders = d.orders || [];
+    if (orders.length === 0) {
+      html = '<tr><td colspan=11 class="muted">No open orders</td></tr>';
+    } else {
+      for (const o of orders) {
+        const ts = o.createdTime ? new Date(parseInt(o.createdTime)).toISOString().replace('T',' ').slice(0,19) : '—';
+        html += '<tr>'
+          + '<td>' + ts + '</td>'
+          + '<td><b>' + o.symbol + '</b></td>'
+          + '<td>' + o.side + '</td>'
+          + '<td>' + o.orderType + '</td>'
+          + '<td>' + (o.price && o.price !== '0' ? fmt(o.price, 6) : '—') + '</td>'
+          + '<td>' + (o.triggerPrice && o.triggerPrice !== '0' ? fmt(o.triggerPrice, 6) : '—') + '</td>'
+          + '<td>' + o.qty + '</td>'
+          + '<td>' + (o.filledQty || '0') + '</td>'
+          + '<td>' + (o.reduceOnly === 'true' ? '✓' : '') + '</td>'
+          + '<td>' + o.status + '</td>'
+          + '<td class="action-cell"><button class="btn danger small" onclick="cancelOrder(\\'' + o.symbol + '\\',\\'' + o.orderId + '\\')">Cancel</button></td>'
+          + '</tr>';
+      }
+    }
+    $('ord-table').querySelector('tbody').innerHTML = html;
+  } catch(e) { $('ord-table').querySelector('tbody').innerHTML = '<tr><td colspan=11>ERR: ' + e + '</td></tr>'; }
+}
+
+// ── Trades tab ──
+async function loadTrades() {
+  try {
+    const r = await fetch(API('/api/live/trades'));
+    const d = await r.json();
+    if (d.error) { $('trades-table').querySelector('tbody').innerHTML = '<tr><td colspan=8 class="muted">' + d.error + '</td></tr>'; return; }
+    let html = '';
+    const trades = d.trades || [];
+    if (trades.length === 0) {
+      html = '<tr><td colspan=8 class="muted">No closed trades</td></tr>';
+    } else {
+      for (const t of trades) {
+        const cls = t.pnl > 0 ? 'pos' : 'neg';
+        html += '<tr>'
+          + '<td>' + (t.date || '—') + '</td>'
+          + '<td><b>' + t.symbol + '</b></td>'
+          + '<td>' + t.side + '</td>'
+          + '<td>' + t.qty + '</td>'
+          + '<td>' + fmt(t.entry, 6) + '</td>'
+          + '<td>' + fmt(t.exit, 6) + '</td>'
+          + '<td>' + (t.leverage || '—') + '</td>'
+          + '<td class="' + cls + '">' + fmt(t.pnl) + '</td>'
+          + '</tr>';
+      }
+    }
+    $('trades-table').querySelector('tbody').innerHTML = html;
+  } catch(e) { $('trades-table').querySelector('tbody').innerHTML = '<tr><td colspan=8>ERR: ' + e + '</td></tr>'; }
+}
+
+// ── Config tab ──
+async function loadConfig() {
+  try {
+    const r = await fetch(API('/api/config'));
+    const d = await r.json();
+    if (d.error) { toast('Config load error: ' + d.error, 'err'); return; }
+    const c = d.config || {};
+    $('cfg-min_gain_pct').value = c.min_gain_pct ?? '';
+    $('cfg-tp_chain').value = Array.isArray(c.tp_chain) ? c.tp_chain.join(', ') : (c.tp_chain || '');
+    $('cfg-trail_pct').value = c.trail_pct ?? '';
+    $('cfg-sl_pct').value = c.sl_pct ?? '';
+    $('cfg-dca_trigger_pct').value = Array.isArray(c.dca_trigger_pct) ? c.dca_trigger_pct.join(', ') : (c.dca_trigger_pct || '');
+    $('cfg-dca_max_count').value = c.dca_max_count ?? '';
+    $('cfg-max_open_positions').value = c.max_open_positions ?? '';
+    $('cfg-risk_notional_pct').value = c.risk_notional_pct ?? '';
+    $('cfg-leverage').value = c.leverage ?? '';
+    $('cfg-max_daily_entries').value = c.max_daily_entries ?? '';
+    $('cfg-ranking_interval_min').value = c.ranking_interval_min ?? '';
+    $('cfg-min_volume_usd').value = c.min_volume_usd ?? '';
+  } catch(e) { toast('Config load error: ' + e, 'err'); }
+}
+
+async function saveConfig() {
+  if (!confirm('Save config.yaml? This updates the file on disk (bot restart needed to apply).')) return;
+  const body = {
+    min_gain_pct: parseFloat($('cfg-min_gain_pct').value),
+    tp_chain: $('cfg-tp_chain').value,
+    trail_pct: parseFloat($('cfg-trail_pct').value),
+    sl_pct: parseFloat($('cfg-sl_pct').value),
+    dca_trigger_pct: $('cfg-dca_trigger_pct').value,
+    dca_max_count: parseInt($('cfg-dca_max_count').value),
+    max_open_positions: parseInt($('cfg-max_open_positions').value),
+    risk_notional_pct: parseFloat($('cfg-risk_notional_pct').value),
+    leverage: parseFloat($('cfg-leverage').value),
+    max_daily_entries: parseInt($('cfg-max_daily_entries').value),
+    ranking_interval_min: parseInt($('cfg-ranking_interval_min').value),
+    min_volume_usd: parseFloat($('cfg-min_volume_usd').value),
+  };
+  try {
+    const r = await fetch(API('/api/config'), { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    const d = await r.json();
+    if (d.ok || d.ok === false && d.updated) {
+      toast('Config saved: ' + d.msg, d.ok ? 'ok' : 'err');
+    } else {
+      toast('Config save: ' + (d.msg || d.error || 'unknown'), 'err');
+    }
+  } catch(e) { toast('Config save error: ' + e, 'err'); }
+}
+
+async function applyToBot() {
+  if (!confirm('Apply config to bot? This will restart short-bot.service (systemctl restart). The bot will reload config from disk.\\n\\nMake sure you saved config first!')) return;
+  try {
+    const r = await fetch(API('/api/bot/restart'), { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) {
+      toast('Bot restarted: ' + d.msg, 'ok');
+      setTimeout(loadBotStatus, 2000);
+    } else {
+      toast('Restart failed: ' + (d.msg || d.error), 'err');
+    }
+  } catch(e) { toast('Restart error: ' + e, 'err'); }
+}
+
+// ── Actions ──
+async function closePosition(symbol, qty) {
+  if (!confirm('CLOSE position ' + symbol + ' qty=' + qty + '?\\nThis will cancel all orders and place a market buy (reduce-only).')) return;
+  try {
+    const r = await fetch(API('/api/position/close'), { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ symbol, qty }) });
+    const d = await r.json();
+    if (d.ok) toast('Closed ' + symbol + ': ' + d.msg, 'ok');
+    else toast('Close failed: ' + (d.msg || d.error), 'err');
+    setTimeout(() => { loadPositions(); loadOrders(); loadOverview(); }, 1500);
+  } catch(e) { toast('Close error: ' + e, 'err'); }
+}
+
+async function cancelOrder(symbol, orderId) {
+  if (!confirm('Cancel order ' + orderId.slice(0,12) + ' on ' + symbol + '?')) return;
+  try {
+    const r = await fetch(API('/api/order/cancel'), { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ symbol, order_id: orderId }) });
+    const d = await r.json();
+    if (d.ok) toast('Order cancelled: ' + symbol, 'ok');
+    else toast('Cancel failed: ' + (d.msg || d.error), 'err');
+    setTimeout(loadOrders, 1500);
+  } catch(e) { toast('Cancel error: ' + e, 'err'); }
+}
+
+function openModal(type, symbol, qty, currentVal) {
+  modalAction = type;
+  modalData = { symbol, qty };
+  $('modal-title').textContent = type === 'tp' ? 'Move TP' : 'Move SL';
+  $('modal-price-label').textContent = type === 'tp' ? 'TP Trigger Price' : 'SL Trigger Price';
+  $('modal-symbol').textContent = symbol + ' (qty=' + qty + ')';
+  $('modal-price').value = currentVal || '';
+  $('modal-overlay').style.display = 'flex';
+  $('modal-price').focus();
+}
+
+function closeModal() {
+  $('modal-overlay').style.display = 'none';
+  modalAction = null;
+}
+
+async function confirmModal() {
+  const price = parseFloat($('modal-price').value);
+  if (!price || price <= 0) { toast('Invalid price', 'err'); return; }
+  const { symbol, qty } = modalData;
+  const action = modalAction;
+  closeModal();
+  const endpoint = action === 'tp' ? '/api/tp/move' : '/api/sl/move';
+  const bodyKey = action === 'tp' ? 'trigger_price' : 'stop_loss';
+  if (!confirm((action === 'tp' ? 'Move TP' : 'Move SL') + ' for ' + symbol + ' to ' + price + '?')) return;
+  try {
+    const r = await fetch(API(endpoint), { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ symbol, qty, [bodyKey]: price }) });
+    const d = await r.json();
+    if (d.ok) toast((action === 'tp' ? 'TP' : 'SL') + ' moved: ' + (d.msg || 'ok'), 'ok');
+    else toast('Move failed: ' + (d.msg || d.error), 'err');
+    setTimeout(loadPositions, 1500);
+  } catch(e) { toast('Move error: ' + e, 'err'); }
+}
+
+function toggleOpenMode() {
+  const mode = $('open-mode').value;
+  $('open-qty-row').classList.toggle('hidden', mode === 'notional');
+  $('open-notional-row').classList.toggle('hidden', mode === 'qty');
+}
+
+async function openPosition() {
+  const symbol = $('open-symbol').value.toUpperCase().trim();
+  const mode = $('open-mode').value;
+  const leverage = $('open-leverage').value ? parseFloat($('open-leverage').value) : null;
+  if (!symbol) { toast('Symbol required', 'err'); return; }
+  const body = { symbol, leverage };
+  if (mode === 'notional') {
+    body.mode = 'notional';
+    body.notional_pct = parseFloat($('open-notional').value);
+    if (!body.notional_pct) { toast('Notional % required', 'err'); return; }
+  } else {
+    body.mode = 'qty';
+    body.qty = parseFloat($('open-qty').value);
+    if (!body.qty) { toast('Qty required', 'err'); return; }
+  }
+  if (!confirm('OPEN SHORT ' + symbol + ' on Bybit?\\nMode: ' + mode + ', ' + (mode === 'qty' ? 'qty=' + body.qty : 'notional=' + body.notional_pct + '%') + (leverage ? ', lev=' + leverage + 'x' : '') + '\\n\\nThis places a REAL market short order + sets TP/DCA from config.')) return;
+  try {
+    const r = await fetch(API('/api/position/open'), { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    const d = await r.json();
+    if (d.ok) toast('Short opened: ' + d.msg, 'ok');
+    else toast('Open failed: ' + (d.msg || d.error), 'err');
+    setTimeout(() => { loadPositions(); loadOrders(); loadOverview(); }, 2000);
+  } catch(e) { toast('Open error: ' + e, 'err'); }
+}
+
+// ── Auto-refresh ──
+function refreshAll() {
+  loadOverview();
+  loadBotStatus();
+  if (!$('tab-positions').classList.contains('hidden')) loadPositions();
+  if (!$('tab-orders').classList.contains('hidden')) loadOrders();
+}
+
+// Initial load
+loadOverview();
+loadBotStatus();
+loadPositions();
+setInterval(refreshAll, 5000);
+</script>
+</body></html>"""
+
+
+
+
+async def panel_page(request):
+    """Management panel — Bybit-like control interface."""
+    html = PANEL_HTML
+    token = request.query.get("token", "piktor2026")
+    html = html.replace("__TOKEN__", token)
+    return web.Response(text=html, headers={"Content-Type": "text/html; charset=utf-8"})
+
+
+
 LIVE_HTML = """<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1848,6 +2827,18 @@ async def main():
     app.router.add_get("/api/live/trades", api_live_trades)
     app.router.add_get("/api/live/chart", api_live_chart)
     app.router.add_get("/live", live_page)
+    app.router.add_get("/panel", panel_page)
+    # PANEL API — config / bot control / orders
+    app.router.add_get("/api/config", api_config_get)
+    app.router.add_post("/api/config", api_config_save)
+    app.router.add_post("/api/bot/restart", api_bot_restart)
+    app.router.add_post("/api/bot/status", api_bot_status)
+    app.router.add_post("/api/position/close", api_position_close)
+    app.router.add_post("/api/order/cancel", api_order_cancel)
+    app.router.add_post("/api/tp/move", api_tp_move)
+    app.router.add_post("/api/sl/move", api_sl_move)
+    app.router.add_post("/api/position/open", api_position_open)
+    app.router.add_get("/api/orders", api_orders)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8077)
