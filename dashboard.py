@@ -1983,6 +1983,7 @@ input:focus, select:focus { border-color: #f0b90b; outline: none; }
     <div class="tab" data-tab="config">Config</div>
     <div class="tab" data-tab="trades">Trades</div>
     <div class="tab" data-tab="open">Open Position</div>
+    <div class="tab" data-tab="chart">Chart</div>
   </div>
 
   <!-- Tab: Positions -->
@@ -2193,7 +2194,7 @@ async function loadPositions() {
       for (const p of positions) {
         const pnlCls = p.unrealisedPnl > 0 ? 'pos' : 'neg';
         html += '<tr>'
-          + '<td><b><a href="#" onclick="chartFromPos(\'' + p.symbol + '\');return false" style="color:#4a9eff;text-decoration:none">' + p.symbol + '</a></b></td>'
+          + '<td><b><a href="#" data-sym="' + p.symbol + '" onclick="chartFromPos(this.dataset.sym);return false" style="color:#4a9eff;text-decoration:none">' + p.symbol + '</a></b></td>'
           + '<td>' + p.side + '</td>'
           + '<td>' + p.size + '</td>'
           + '<td>' + fmt(p.avgPrice, 6) + '</td>'
@@ -2444,6 +2445,76 @@ function chartFromPos(symbol) {
   document.getElementById('tab-chart').classList.remove('hidden');
   document.getElementById('chart-symbol').value = symbol;
   loadPanelChart(symbol);
+}
+
+async function loadPanelChart(symbol) {
+  if (!symbol) return;
+  try {
+    const r = await fetch(API('/api/live/chart?symbol=' + symbol));
+    const d = await r.json();
+    if (d.error) { toast('Chart error: ' + d.error, 'err'); return; }
+    
+    if (!_chart) {
+      _chart = LightweightCharts.createChart(document.getElementById("chart-container"), {
+        layout: { background: { color: '#0b0e11' }, textColor: '#848e9c' },
+        grid: { vertLines: { color: '#1e2329' }, horzLines: { color: '#1e2329' } },
+        timeScale: { borderColor: '#2b3139', timeVisible: true, secondsVisible: false },
+        priceScale: { borderColor: '#2b3139' },
+        crosshair: { mode: 0 },
+      });
+      _candleSeries = _chart.addCandlestickSeries({
+        upColor: '#0ecb81', downColor: '#f6465d',
+        wickUpColor: '#0ecb81', wickDownColor: '#f6465d',
+        borderVisible: false,
+      });
+    }
+    
+    // Clear old price lines
+    _priceLines.forEach(pl => _candleSeries.removePriceLine(pl));
+    _priceLines = [];
+    
+    // Set candles
+    const candles = (d.candles || []).map(c => ({
+      time: c.t, open: c.o, high: c.h, low: c.l, close: c.c,
+    }));
+    _candleSeries.setData(candles);
+    
+    // Add price lines for position
+    const pos = d.position;
+    if (pos && pos.size > 0) {
+      const avg = pos.avgPrice;
+      _priceLines.push(_candleSeries.createPriceLine({ price: avg, color: '#f0b90b', lineWidth: 2, lineStyle: 0, title: 'Entry ' + avg, axisLabelVisible: true }));
+      
+      // TP
+      if (d.dca_levels && d.dca_levels.length > 0) {
+        // TP = avg * 0.8 (20% below avg)
+        const tp = avg * 0.8;
+        _priceLines.push(_candleSeries.createPriceLine({ price: tp, color: '#0ecb81', lineWidth: 1, lineStyle: 2, title: 'TP ' + tp.toFixed(4), axisLabelVisible: true }));
+      }
+      
+      // DCA levels
+      (d.dca_levels || []).forEach((lvl, i) => {
+        _priceLines.push(_candleSeries.createPriceLine({ price: lvl, color: '#f6465d', lineWidth: 1, lineStyle: 1, title: 'DCAx' + (i+1) + ' ' + lvl.toFixed(4), axisLabelVisible: true }));
+      });
+    }
+    
+    // Info text
+    if (pos && pos.size > 0) {
+      const lastC = candles.length ? candles[candles.length-1].close : 0;
+      const pnl = (avg - lastC) * pos.size;
+      document.getElementById("panel-chart-info").innerHTML = '<span class="muted">Side:</span> ' + pos.side + 
+        ' | <span class="muted">Size:</span> ' + pos.size + 
+        ' | <span class="muted">Avg:</span> ' + avg + 
+        ' | <span class="muted">Price:</span> ' + lastC + 
+        ' | <span class="muted">uPnL:</span> <span style="color:' + (pnl>=0?'#0ecb81':'#f6465d') + '">' + pnl.toFixed(4) + '</span>';
+    } else {
+      document.getElementById("panel-chart-info").innerHTML = '<span class="muted">No open position for ' + symbol + '</span>';
+    }
+    
+    _chart.timeScale().fitContent();
+  } catch(e) {
+    toast('Chart load failed: ' + e.message, 'err');
+  }
 }
 
 setInterval(refreshAll, 5000);
@@ -2840,75 +2911,7 @@ loadOverview();
 // ── Chart ──
 let _chart = null, _candleSeries = null, _priceLines = [];
 
-async function loadPanelChart(symbol) {
-  if (!symbol) return;
-  try {
-    const r = await fetch(API('/api/live/chart?symbol=' + symbol));
-    const d = await r.json();
-    if (d.error) { toast('Chart error: ' + d.error, 'err'); return; }
-    
-    if (!_chart) {
-      _chart = LightweightCharts.createChart(document.getElementById("chart-container"), {
-        layout: { background: { color: '#0b0e11' }, textColor: '#848e9c' },
-        grid: { vertLines: { color: '#1e2329' }, horzLines: { color: '#1e2329' } },
-        timeScale: { borderColor: '#2b3139', timeVisible: true, secondsVisible: false },
-        priceScale: { borderColor: '#2b3139' },
-        crosshair: { mode: 0 },
-      });
-      _candleSeries = _chart.addCandlestickSeries({
-        upColor: '#0ecb81', downColor: '#f6465d',
-        wickUpColor: '#0ecb81', wickDownColor: '#f6465d',
-        borderVisible: false,
-      });
-    }
-    
-    // Clear old price lines
-    _priceLines.forEach(pl => _candleSeries.removePriceLine(pl));
-    _priceLines = [];
-    
-    // Set candles
-    const candles = (d.candles || []).map(c => ({
-      time: c.t, open: c.o, high: c.h, low: c.l, close: c.c,
-    }));
-    _candleSeries.setData(candles);
-    
-    // Add price lines for position
-    const pos = d.position;
-    if (pos && pos.size > 0) {
-      const avg = pos.avgPrice;
-      _priceLines.push(_candleSeries.createPriceLine({ price: avg, color: '#f0b90b', lineWidth: 2, lineStyle: 0, title: 'Entry ' + avg, axisLabelVisible: true }));
-      
-      // TP
-      if (d.dca_levels && d.dca_levels.length > 0) {
-        // TP = avg * 0.8 (20% below avg)
-        const tp = avg * 0.8;
-        _priceLines.push(_candleSeries.createPriceLine({ price: tp, color: '#0ecb81', lineWidth: 1, lineStyle: 2, title: 'TP ' + tp.toFixed(4), axisLabelVisible: true }));
-      }
-      
-      // DCA levels
-      (d.dca_levels || []).forEach((lvl, i) => {
-        _priceLines.push(_candleSeries.createPriceLine({ price: lvl, color: '#f6465d', lineWidth: 1, lineStyle: 1, title: 'DCAx' + (i+1) + ' ' + lvl.toFixed(4), axisLabelVisible: true }));
-      });
-    }
-    
-    // Info text
-    if (pos && pos.size > 0) {
-      const lastC = candles.length ? candles[candles.length-1].close : 0;
-      const pnl = (avg - lastC) * pos.size;
-      document.getElementById("panel-chart-info").innerHTML = '<span class="muted">Side:</span> ' + pos.side + 
-        ' | <span class="muted">Size:</span> ' + pos.size + 
-        ' | <span class="muted">Avg:</span> ' + avg + 
-        ' | <span class="muted">Price:</span> ' + lastC + 
-        ' | <span class="muted">uPnL:</span> <span style="color:' + (pnl>=0?'#0ecb81':'#f6465d') + '">' + pnl.toFixed(4) + '</span>';
-    } else {
-      document.getElementById("panel-chart-info").innerHTML = '<span class="muted">No open position for ' + symbol + '</span>';
-    }
-    
-    _chart.timeScale().fitContent();
-  } catch(e) {
-    toast('Chart load failed: ' + e.message, 'err');
-  }
-}
+
 
 setInterval(loadOverview, 5000);
 </script>
