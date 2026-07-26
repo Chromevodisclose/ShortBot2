@@ -932,17 +932,40 @@ async def api_live_open(req):
                                 "status": o.get("orderStatus", ""),
                                 "triggerPrice": tp_raw,
                             })
+                    size = float(p["size"])
+                    avg = float(p.get("avgPrice", 0))
+                    notional = size * avg
+                    u_pnl = float(p.get("unrealisedPnl", 0))
+                    pnl_pct = (u_pnl / notional * 100) if notional > 0 else 0
+                    # Funding: fetch from tickers
+                    funding_rate = ""
+                    funding_time = ""
+                    try:
+                        dt = _bybit_signed_get("/v5/market/tickers", f"category=linear&symbol={p['symbol']}")
+                        if dt.get("retCode") == 0 and dt["result"]["list"]:
+                            t = dt["result"]["list"][0]
+                            funding_rate = t.get("fundingRate", "")
+                            nft = t.get("nextFundingTime", "")
+                            if nft and str(nft) != "0":
+                                from datetime import datetime, timezone
+                                funding_time = datetime.fromtimestamp(int(nft)/1000, tz=timezone.utc).strftime("%H:%M UTC")
+                    except: pass
                     positions.append({
                         "symbol": p["symbol"],
-                        "size": float(p["size"]),
+                        "size": size,
                         "side": p["side"],
-                        "avgPrice": float(p.get("avgPrice", 0)),
+                        "avgPrice": avg,
                         "leverage": p.get("leverage", ""),
-                        "takeProfit": p.get("takeProfit", ""),
+                        "notional": round(notional, 2),
+                        "unrealisedPnl": u_pnl,
+                        "pnlPct": round(pnl_pct, 2),
+                        "realisedPnl": float(p.get("curRealisedPnl", 0)),
+                        "fundingRate": funding_rate,
+                        "fundingTime": funding_time,
+                        "takeProfit": p.get("takeProfit", "") or tp_trigger,
                         "stopLoss": p.get("stopLoss", ""),
                         "trailingStop": p.get("trailingStop", ""),
                         "activePrice": p.get("activePrice", ""),
-                        "unrealisedPnl": float(p.get("unrealisedPnl", 0)),
                         "dca_orders": dca_orders,
                     })
         return web.json_response({"positions": positions})
@@ -1991,8 +2014,8 @@ input:focus, select:focus { border-color: #f0b90b; outline: none; }
     <div class="card">
       <h3>Open Positions (Bybit realtime) <span class="refresh-indicator"></span></h3>
       <table id="pos-table"><thead><tr>
-        <th>Symbol</th><th>Side</th><th>Size</th><th>Avg Price</th><th>Lev</th>
-        <th>uPnL</th><th>TP</th><th>SL</th><th>Trail</th><th>Actions</th>
+        <th>Symbol</th><th>Side</th><th>Size</th><th>Notional $</th><th>Avg Price</th><th>Lev</th>
+        <th>uPnL $</th><th>PnL %</th><th>rPnL $</th><th>Funding</th><th>Next Fund</th><th>TP</th><th>SL</th><th>Trail</th><th>Actions</th>
       </tr></thead><tbody></tbody></table>
     </div>
   </div>
@@ -2185,11 +2208,11 @@ async function loadPositions() {
   try {
     const r = await fetch(API('/api/live/open'));
     const d = await r.json();
-    if (d.error) { $('pos-table').querySelector('tbody').innerHTML = '<tr><td colspan=10 class="muted">' + d.error + '</td></tr>'; return; }
+    if (d.error) { $('pos-table').querySelector('tbody').innerHTML = '<tr><td colspan=15 class="muted">' + d.error + '</td></tr>'; return; }
     let html = '';
     const positions = d.positions || [];
     if (positions.length === 0) {
-      html = '<tr><td colspan=10 class="muted">No open positions</td></tr>';
+      html = '<tr><td colspan=15 class="muted">No open positions</td></tr>';
     } else {
       for (const p of positions) {
         const pnlCls = p.unrealisedPnl > 0 ? 'pos' : 'neg';
@@ -2197,9 +2220,14 @@ async function loadPositions() {
           + '<td><b><a href="#" data-sym="' + p.symbol + '" onclick="chartFromPos(this.dataset.sym);return false" style="color:#4a9eff;text-decoration:none">' + p.symbol + '</a></b></td>'
           + '<td>' + p.side + '</td>'
           + '<td>' + p.size + '</td>'
+          + '<td>' + (p.notional || '—') + '</td>'
           + '<td>' + fmt(p.avgPrice, 6) + '</td>'
           + '<td>' + p.leverage + 'x</td>'
           + '<td class="' + pnlCls + '">' + fmt(p.unrealisedPnl) + '</td>'
+          + '<td class="' + pnlCls + '">' + (p.pnlPct || 0) + '%</td>'
+          + '<td>' + fmt(p.realisedPnl || 0) + '</td>'
+          + '<td>' + (p.fundingRate || '—') + '</td>'
+          + '<td>' + (p.fundingTime || '—') + '</td>'
           + '<td>' + (p.takeProfit || '—') + '</td>'
           + '<td>' + (p.stopLoss || '—') + '</td>'
           + '<td>' + (p.trailingStop && p.trailingStop !== '0' ? p.trailingStop : '—') + '</td>'
@@ -2211,7 +2239,7 @@ async function loadPositions() {
       }
     }
     $('pos-table').querySelector('tbody').innerHTML = html;
-  } catch(e) { $('pos-table').querySelector('tbody').innerHTML = '<tr><td colspan=10>ERR: ' + e + '</td></tr>'; }
+  } catch(e) { $('pos-table').querySelector('tbody').innerHTML = '<tr><td colspan=15>ERR: ' + e + '</td></tr>'; }
 }
 
 // ── Orders tab ──
