@@ -2,7 +2,7 @@
 """Short Bot #2 — paper trading на реальных данных Bybit.
 Сценарий Б: монета впервые #1 по росту → откат на #2 → шорт #2.
 WS kline + ticker, ранжирование, paper executor с комиссиями/проскальзыванием/фандингом."""
-import asyncio, json, os, sys, time, logging, signal as sig
+import asyncio, json, os, sys, time, logging, signal as sig, atexit
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from collections import defaultdict
@@ -833,7 +833,28 @@ async def main():
     await asyncio.gather(*tasks)
 
 
+LOCK_FILE = os.path.join(os.path.dirname(__file__), "logs", "bot.pid")
+
+def acquire_pid_lock():
+    """PID-lock: не дать двум процессам bot.py работать одновременно.
+    Если lock-файл существует и PID в нём жив — завершаемся."""
+    if os.path.exists(LOCK_FILE):
+        try:
+            old_pid = int(open(LOCK_FILE).read().strip())
+            try:
+                os.kill(old_pid, 0)
+                print(f"FATAL: bot.py уже запущен (PID {old_pid}). Дубликат запрещён.", flush=True)
+                log.error(f"FATAL: дубликат процесса — уже запущен PID {old_pid}, выходим")
+                sys.exit(1)
+            except (OSError, ProcessLookupError):
+                pass  # старый PID мёртв — забираем lock
+        except ValueError:
+            pass  # файл повреждён
+    open(LOCK_FILE, "w").write(str(os.getpid()))
+    atexit.register(lambda: os.path.exists(LOCK_FILE) and os.remove(LOCK_FILE))
+
 if __name__ == "__main__":
+    acquire_pid_lock()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
