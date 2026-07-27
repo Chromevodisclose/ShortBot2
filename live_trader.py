@@ -320,6 +320,27 @@ def reconcile_dca_limits(pos):
                 log.error(f"[{sym}] reconcile: place DCAx{lvl_num} error: {e}")
     pos["dca_order_ids"] = dca_ids
 
+    # 3. Отменяем orphaned TP conditional-ордера (дубликаты от multi-process).
+    # Оставляем ТОЛЬКО pos['tp_order_id'] — все остальные TP/Stop-ордера отменяем.
+    keep_tp = pos.get("tp_order_id")
+    keep_sl = pos.get("sl_order_id")
+    try:
+        all_orders = get_open_orders(sym)
+    except Exception as e:
+        log.error(f"[{sym}] reconcile: get_open_orders (stop) error: {e}")
+        all_orders = []
+    for o in all_orders:
+        otype = o.get("orderType", "")
+        oid = o.get("orderId", "")
+        # TP conditional = Market + stopOrderType != '' (tpmode) или triggerPrice есть
+        is_conditional = o.get("stopOrderType") and o.get("stopOrderType") != "" or o.get("triggerPrice", "") != ""
+        if is_conditional and oid != keep_tp and oid != keep_sl:
+            try:
+                cancel_order(sym, oid)
+                log.info(f"[{sym}] reconcile: orphaned TP/SL conditional отменён orderId={oid[:12]}...")
+            except Exception as e:
+                log.error(f"[{sym}] reconcile: cancel TP/SL error: {e}")
+
 
 def restore_positions_from_exchange(existing_symbols):
     """
@@ -527,6 +548,7 @@ def sync_position(pos):
     for lvl in remaining:
         # Проверить — стоит ли уже лимитка близко
         close = any(abs(p - lvl["fill_price"]) < current_avg * 0.001 for p in existing_prices)
+        oid = None
         if not close:
             dca_qty = original_qty * DCA_MULT
             oid = place_dca_limit(sym, dca_qty, lvl["fill_price"])

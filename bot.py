@@ -468,6 +468,11 @@ def check_signal(ts):
     # c1 стала #1 впервые
     if c1 not in STATE.first1_today and c1 not in STATE.traded_today:
         STATE.first1_today.add(c1)
+    # Защита от дубль-входа: если уже есть открытая позиция по c2 — пропустить
+    # (в т.ч. при дубликатах процессов / race condition)
+    if any(p.get("symbol") == c2 for p in STATE.open_positions):
+        STATE.prev_rank1 = c1
+        return
     # сигнал: c2 БЫЛА #1 на прошлом шаге, сейчас упала на #2
     if (STATE.prev_rank1 == c2 and c2 in STATE.first1_today
             and c2 not in STATE.traded_today and c2 != c1):
